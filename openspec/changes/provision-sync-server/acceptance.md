@@ -8,14 +8,14 @@ failed ACME attempts. The replacement authorized test host is
 `201.34.146.81` (Ubuntu 26.04 amd64) with
 `test.obsidian-sync.wholedata.ru`. Neither host is production. Task 6.6
 remains incomplete. The original host had no successful credential handoff;
-the replacement host has a root-owned `0600` handoff at
-`/root/fos-cli-smoke/docker-credentials.json`. Its secret values were not
-printed in test output or this record.
+the replacement host has had root-owned `0600` Docker and Podman handoffs.
+Their secret values were not printed in test output or this record. The
+operator plans to remove the replacement host separately.
 
 Some runtime evidence below predates removal of NATS monitoring port 8222 and
 is labeled accordingly. The replacement Docker deployment was updated and
-rechecked afterward, as recorded below. Task 6.6 remains incomplete for the
-other runtime modes and independent network-vantage checks.
+rechecked afterward, then replaced with a full Podman deployment. Task 6.6
+remains incomplete for native end-to-end runtime checks.
 
 ## Executed checks
 
@@ -117,11 +117,38 @@ The updated bundle passed the live verification. Fresh single-vault installs
 still need a real second bucket for this negative check; this is a remaining
 operator/CLI verification limitation, not a passed single-vault gate.
 
+## Full Podman CLI bootstrap (2026-09-23)
+
+On the replacement host, the operator-approved Docker-to-Podman cutover used
+verified source commit `10e6bed`. The live Docker-managed files, data, and
+credentials were first saved in a root-only archive at
+`/var/backups/flash-osidian-sync/pre-podman-20260923/docker-managed-before-podman-10e6bed.tar`.
+`fos uninstall --approve` stopped Docker while preserving data; the
+source-built CLI then completed noninteractive Podman bootstrap (exit 0) with
+root-owned `0600` secrets output at `/root/fos-podman-secrets-10e6bed.json`.
+Docker service and socket remain stopped; the Podman stack remains running.
+
+| Gate | Evidence | Result |
+| --- | --- | --- |
+| Full CLI handoff | Source build and install at `10e6bed`; `fos bootstrap --non-interactive`; `fos status` | `fos 0.1.0` reported `MANAGED — podman`; Caddy and NATS containers running. All four digest-pinned images were pulled. |
+| Administrator and scoped vault | `fos vault list`; `fos vault verify` with the existing real peer bucket | Administrator listing passed; verification returned `ownBucket:true`, `crossBucket:"denied"`. The existing `smoke-docker` bucket remained listed. |
+| Managed topology | Host `ss`, Podman inspect, generated NATS configuration | Host listeners were 22/80/443 only; Caddy published 80/443, NATS had no host port bindings. NATS WebSocket listener was private on 9222; no 8222 HTTP monitoring listener or route was generated. |
+| Trusted public endpoint | External HTTPS/WSS HTTP/1.1 Upgrade check | TLS verification returned 0 and WebSocket Upgrade returned HTTP 101 for `test.obsidian-sync.wholedata.ru`. |
+| External TCP reachability | Independent Check-Host probes after the host-forwarding repair | [80](https://check-host.net/check-report/4ce8cd0akc54) connected from 3/3 nodes; [443](https://check-host.net/check-report/4ce8cd1akddc) connected from 2/3 and timed out from one. [4222](https://check-host.net/check-report/4ce8ccf8kd1a) and [9222](https://check-host.net/check-report/4ce8cd13kddd) were refused by 3/3 nodes. |
+| Monitoring-port negative | [First 8222 probe](https://check-host.net/check-report/4ce8cd05k9e) and [selected-node repeat](https://check-host.net/check-report/4ce8d4c3ka40), simultaneous host packet capture | One external node initially reported a connection despite no host listener, binding, or NATS monitoring configuration. During the repeat, incoming 8222 SYNs reached the host and it answered each with RST/ACK. The first report was not reproduced. |
+
+The first public ingress attempt after Podman cutover timed out despite
+healthy containers: host packet capture showed incoming 80/443 SYNs but no
+SYN-ACK. Docker's leftover `FORWARD`/`DOCKER-USER` iptables chain blocked
+traffic forwarded to Podman's Netavark bridge. Two narrow, temporary IPv4
+`DOCKER-USER` accept rules for Caddy's 80/443 forward and established return
+traffic restored public ingress; Docker's default forwarding policy was not
+changed. The rules were not proven persistent across reboot. This successful
+Podman handoff needed a host-network repair after Docker coexistence; it does
+not prove fresh Podman bootstrap handles that Docker firewall state itself.
+
 ## Required gates not executed
 
-- Full `fos bootstrap` with Podman, public ACME/domain readiness, and protected
-  credential handoff. The isolated rootful Podman stack and loopback TLS/WSS
-  checks passed, but did not exercise that CLI end-to-end path.
 - Native Debian 13 amd64 systemd/domain smoke check; exact stock APT package
   installation and binary execution passed only inside a disposable container.
 - Native Ubuntu 24.04 amd64 systemd/domain smoke check; exact stock APT package
@@ -134,9 +161,9 @@ operator/CLI verification limitation, not a passed single-vault gate.
 
 ## Acceptance status
 
-Task **6.6 remains unchecked**. Docker Compose on the replacement host has
-passed real bootstrap, trusted TLS/WSS, first-bucket provisioning, scoped
-vault operations, and unauthenticated/cross-bucket negatives. Other OS/mode
-runtime gates and the live single-vault probe limitation remain open. The
-independent external port check passed for tested IPv4 vantages. No production
+Task **6.6 remains unchecked**. Docker Compose and Podman on the replacement
+host have each passed real CLI bootstrap, trusted TLS/WSS, first-bucket
+provisioning, and scoped vault operations. Native end-to-end OS gates and the
+live single-vault probe limitation remain open. Podman public ingress needed
+a temporary, narrow firewall repair after Docker removal. No production
 installation is claimed.
