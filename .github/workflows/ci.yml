@@ -1,0 +1,28 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build:plugin
+      - run: npm run test:unit
+      - name: Prepare disposable NATS server
+        run: |
+          curl -fsSL https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-linux-amd64.tar.gz -o "$RUNNER_TEMP/nats-server.tar.gz"
+          echo "5d2c51caca950333aba84911df7d377f826f3a59ec36061c6539105084f65c92  $RUNNER_TEMP/nats-server.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/nats-server.tar.gz" -C "$RUNNER_TEMP"
+          echo "NATS_SERVER_BIN=$RUNNER_TEMP/nats-server-v2.15.0-linux-amd64/nats-server" >> "$GITHUB_ENV"
+      - run: npm run test:integration
+      - run: NATS_TEST_DOCKER=1 npx vitest run tests/integration/recovery-nats.test.ts
+      - run: S3_TEST_DOCKER=1 npx vitest run tests/integration/blob-minio.test.ts
+      - run: npm run test:simulation

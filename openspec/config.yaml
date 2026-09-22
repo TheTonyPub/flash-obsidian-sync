@@ -1,0 +1,56 @@
+schema: spec-driven
+
+context: |
+  Product: self-hosted realtime synchronization for personal Obsidian vaults.
+  Each local vault binds to one stable vaultId and one distinct NATS KV bucket;
+  several vaults can use the same NATS server without mixing records.
+  Primary implementation: an Obsidian community plugin written for Desktop and Mobile.
+  Transport and remote state: direct WSS connection to NATS JetStream KV.
+  Authentication: dedicated NATS username/password per vault, checked by NATS
+  on connection; bucket-scoped permissions, no separate authentication API.
+  Normal Markdown is stored inline in KV; binary and oversized content use
+  S3-compatible object storage with SHA-256 verification.
+  Plugin owns stable file identity, local IndexedDB index and outbox, remote
+  reconciliation, feedback-loop suppression, and client-side conflict handling.
+  Infrastructure deployment, configuration, operations, and incident handling
+  remain user-owned and are outside plugin change scope. CI workflows may be added.
+  Repository must include a short user-run NATS setup guide: one JetStream/KV
+  bucket and NATS user per vault, backing-subject names, required permissions,
+  WSS endpoint, and plugin settings.
+  The guide is configuration reference, not deployment automation or troubleshooting.
+  Preserve data over automatic resolution: no silently discarded local content.
+  Mobile suspension is not background synchronization; reconnect and reconcile on resume.
+
+rules:
+  proposal:
+    - Scope each change to the plugin unless the user explicitly requests infrastructure work.
+    - State deployment and runtime operations as user-owned non-goals.
+    - Identify affected acceptance criteria and invariants from the architecture baseline.
+    - Prefer thin vertical slices with explicit exit conditions.
+    - Include required user-run NATS setup documentation when plugin connectivity changes.
+  design:
+    - Keep NATS JetStream KV as the remote state store; do not introduce a custom sync backend or database without an approved design change.
+    - Keep normal Markdown off the S3 path; use configurable 512 KiB initial inline limit.
+    - Preserve stable fileId across rename and never use client clocks to choose a winner.
+    - Store credentials only in Obsidian SecretStorage, never plugin data.json.
+    - Use direct NATS authentication and per-vault bucket permissions; never treat vaultId as an access credential.
+  specs:
+    - Express data-preservation, idempotency, durable-outbox, and no-feedback-loop behavior as testable scenarios.
+    - Separate online, offline, reconnect, conflict, rename/delete, and blob behaviors.
+  tasks:
+    - "Order work by TDD: requirement-derived failing tests, minimal implementation, then verification."
+    - Keep tasks plugin-focused; GitHub Actions are allowed, deployment automation is not.
+    - Assign gpt-5.6-terra medium to architecture/proposal work, gpt-5.6-terra low to implementation, and gpt-5.6-luna medium to tests.
+    - Add short NATS KV configuration documentation before an MVP release candidate.
+
+operations:
+  apply:
+    guidance:
+      - Use CodeGraph before code search or codebase explanation; use text search only when needed.
+      - Use Caveman mode for concise command output and status reporting.
+      - Do not deploy, configure, or troubleshoot user-hosted services unless explicitly authorized.
+      - Run focused unit tests before integration or simulation tests; report executed evidence only.
+  archive:
+    guidance:
+      - Require passing requirement-derived tests and explicit evidence for claimed acceptance criteria.
+      - Do not treat an unexecuted deployment scenario as accepted.
