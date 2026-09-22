@@ -86,9 +86,27 @@ the operator deleted the host. No state or credential output was issued.
 | Caddy and public WSS | Generated Caddyfile has explicit Let's Encrypt ACME directory and `mail@hello.com`; Caddy logged `certificate obtained successfully`; external `curl --resolve ...` with normal verification returned WebSocket HTTP `101`, `ssl_verify_result=0`; `openssl s_client` showed Let's Encrypt `YE1` | Passed on the test domain. |
 | First KV bucket | `fos vault list` and `inspect` using protected administrator input; internal-only NATS `/jsz?streams=true` | `OBS_smoke-docker_FILES` exists, file storage, history 10, replicas 1. Monitoring returned HTTP 200 only from the private Docker network in this pre-removal deployment. |
 | Scoped vault and negative authentication | `fos vault verify` with protected vault input after a verifier fix; separate unauthenticated worker request | Own-bucket status/watch/write/read and cross-bucket denial passed (`{"verified":true}`); unauthenticated request exited 1 with authentication rejection. A test-only `OBS___fos_cross_probe_FILES` bucket remains as the real cross-bucket target. |
-| Internal port exposure | Docker NATS `PortBindings` was `{}`; host `ss` showed listeners only on 80/443. External `nc` reported TCP success on 4222/8222/9222, but a simultaneous host `tcpdump -ni eth0` captured zero inbound packets for all three; HTTP to 8222 returned an empty response. | NATS has no host listener or published binding. The apparent TCP success did not reach this host from the test vantage, so a separate independent internet vantage is still needed for conclusive public-network isolation. |
+| Initial port check | Docker NATS `PortBindings` was `{}`; host `ss` showed listeners only on 80/443. A workstation `nc` probe appeared to succeed on 4222/8222/9222, but simultaneous host `tcpdump -ni eth0` captured no inbound packets for them. | The workstation result did not prove server exposure; it was superseded by independent checks below. |
 | No-monitoring update | Backed up the two managed files, removed the exact `http_port: 8222` and Compose `expose` entries, validated Compose and NATS configuration, then recreated only NATS. The managed files have no `8222` reference; Docker NATS `PortBindings` is `{}` and host `ss` lists only 80/443. `fos status` reports `MANAGED — docker`. | Passed on the replacement host; the prior live monitoring probe is historical only. |
 | TLS/WSS after no-monitoring update | External HTTPS check reported `ssl_verify_result=0`; HTTP/1.1 WebSocket Upgrade through Caddy returned `101` after the NATS restart. | Passed on `test.obsidian-sync.wholedata.ru`. |
+| Independent public-port check | Check-Host TCP probes from three remote nodes per port reached [80](https://check-host.net/check-report/4ce72f1dkf78) and [443](https://check-host.net/check-report/4ce72f27k60c). All three nodes refused [4222](https://check-host.net/check-report/4ce72ef0k7c4) and [8222](https://check-host.net/check-report/4ce72f0akdfd). For [9222](https://check-host.net/check-report/4ce72ef3kb86), two refused and one timed out; a [five-node repeat](https://check-host.net/check-report/4ce7337dk76b) produced four refusals and one timeout. Host `ss` lists only 22/80/443; NATS has no host port bindings; Caddy binds only 80/443. | Passed for tested external IPv4 vantages: Caddy 80/443 reachable, NATS ports not reachable. A timeout is not proof of a local refusal, but no node connected to a NATS port. |
+
+## Isolated Podman runtime acceptance (2026-09-23)
+
+Installed stock Ubuntu 26.04 Podman `5.7.0+ds2-3build1` and
+`podman-compose 1.5.0-2` on the replacement host. Rootful Podman uses
+Netavark. A separate disposable Compose project with Caddy 2.11.4 and NATS
+2.15.0 bound Caddy only to `127.0.0.1:18443`; it did not occupy Docker's
+public 80/443 ports or reuse its JetStream data.
+
+The isolated stack passed authenticated NATS access, JetStream KV
+create/write/read, persistence after NATS restart, Caddy TLS/WebSocket HTTP
+`101`, and authenticated NATS `CONNECT`/`PING`/`PONG` over WSS. NATS had no
+host port bindings and its test configuration had no 8222 HTTP listener. The
+disposable containers and test data were removed. Docker remained healthy;
+the host again listened on only 22/80/443. This verifies the Podman runtime
+and equivalent topology, **not** a full `fos bootstrap` or public ACME/domain
+handoff on Podman.
 
 The first `fos vault verify` incorrectly returned `VAULT_AUTH_REQUIRED` after
 successful own-bucket operations: its worker treated opening a KV handle as
@@ -101,11 +119,9 @@ operator/CLI verification limitation, not a passed single-vault gate.
 
 ## Required gates not executed
 
-- A conclusive independent external-network denial check for NATS ports;
-  Docker/host binding checks passed but external TCP probes were ambiguous.
-- Full Podman NATS+Caddy/TLS acceptance: the provider/volume cycle and managed
-  startup ran, but bridge-container ACME egress failed; restart and endpoint
-  readiness remain unverified.
+- Full `fos bootstrap` with Podman, public ACME/domain readiness, and protected
+  credential handoff. The isolated rootful Podman stack and loopback TLS/WSS
+  checks passed, but did not exercise that CLI end-to-end path.
 - Native Debian 13 amd64 systemd/domain smoke check; exact stock APT package
   installation and binary execution passed only inside a disposable container.
 - Native Ubuntu 24.04 amd64 systemd/domain smoke check; exact stock APT package
@@ -121,5 +137,6 @@ operator/CLI verification limitation, not a passed single-vault gate.
 Task **6.6 remains unchecked**. Docker Compose on the replacement host has
 passed real bootstrap, trusted TLS/WSS, first-bucket provisioning, scoped
 vault operations, and unauthenticated/cross-bucket negatives. Other OS/mode
-runtime gates, the single-vault probe limitation, and conclusive independent
-public-port isolation are still open. No production installation is claimed.
+runtime gates and the live single-vault probe limitation remain open. The
+independent external port check passed for tested IPv4 vantages. No production
+installation is claimed.
