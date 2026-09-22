@@ -9,6 +9,7 @@ describe("fos compose admin client", () => {
     const runtime = { runContainer: vi.fn().mockResolvedValue("ok") };
     await expect(runComposeAdmin(runtime, "flash-osidian-sync", "nats --help\n")).resolves.toBe("ok");
     const [args, stdin] = runtime.runContainer.mock.calls[0]!;
+    expect(args).toContain("docker.io/natsio/nats-box:0.19.7@sha256:ffce8bd103383f179f8c7f11cf645726acf5d17280706c530c3b342dbe16334c");
     expect(args).toContain("--rm"); expect(args).toContain("-i"); expect(args).toContain("flash-osidian-sync_fos-internal");
     expect(args.join(" ")).not.toContain("--env"); expect(args.join(" ")).not.toContain("--volume");
     expect(stdin).toBe("nats --help\n");
@@ -23,6 +24,7 @@ describe("fos compose admin client", () => {
       action: "create", username: "fos-admin", password: "secret", vaultId: "notes",
     });
     const [args, stdin] = runtime.runContainer.mock.calls[0]!;
+    expect(args).toContain("docker.io/library/node:22.22.0-alpine@sha256:e4bf2a82ad0a4037d28035ae71529873c069b13eb0455466ae0bc13363826e34");
     expect(args.join(" ")).not.toContain("secret");
     expect(args.join(" ")).toContain("readonly");
     expect(JSON.parse(stdin)).toMatchObject({ action: "create", username: "fos-admin", password: "secret", vaultId: "notes" });

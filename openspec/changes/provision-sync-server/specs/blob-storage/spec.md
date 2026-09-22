@@ -1,10 +1,4 @@
-# blob-storage Specification
-
-## Purpose
-
-Synchronizes binary and oversized content through immutable, integrity-checked S3-compatible objects while keeping normal Markdown on the KV path.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Blob-backed remote records
 When valid external S3 settings are configured, the plugin SHALL store included binary files and Markdown over the configurable inline limit as SHA-256-addressed blobs. It SHALL complete an upload before publishing a remote record that references the blob. Without valid S3 settings, the plugin SHALL retain files requiring blob storage locally, report them as not synced, and SHALL NOT publish a remote record claiming the missing blob exists. Normal inline Markdown synchronization SHALL remain available.
@@ -20,10 +14,3 @@ When valid external S3 settings are configured, the plugin SHALL store included 
 #### Scenario: S3 is configured later
 - **WHEN** valid S3 settings are added after blob-backed files were held locally
 - **THEN** the plugin resumes their pending uploads without discarding the local files or publishing a reference before each upload completes
-
-### Requirement: Downloaded blobs are verified
-The plugin SHALL verify downloaded blob bytes against the advertised SHA-256 hash before applying them locally.
-
-#### Scenario: Corrupt blob is rejected
-- **WHEN** a blob download hash differs from its remote metadata
-- **THEN** the plugin does not apply the bytes and reports a sync error while retaining pending local state

@@ -30,8 +30,8 @@ describe("fos Docker Compose deployment", () => {
   it("renders pinned Caddy and NATS images on one private network", async () => {
     const deployment = await planDockerDeployment(plan, dockerHost());
 
-    expect(deployment.composeYaml).toMatch(/image:\s*caddy:2\.11\.4@sha256:[a-f0-9]{64}/);
-    expect(deployment.composeYaml).toMatch(/image:\s*nats:2\.15\.0@sha256:[a-f0-9]{64}/);
+    expect(deployment.composeYaml).toMatch(/image:\s*docker\.io\/library\/caddy:2\.11\.4@sha256:[a-f0-9]{64}/);
+    expect(deployment.composeYaml).toMatch(/image:\s*docker\.io\/library\/nats:2\.15\.0@sha256:[a-f0-9]{64}/);
     expect(deployment.composeYaml).toContain("fos-internal:");
     expect(deployment.composeYaml).toContain("caddy:");
     expect(deployment.composeYaml).toContain("nats:");

@@ -1,5 +1,5 @@
 import type { BootstrapPlan } from "./cli.js";
-import { imageLock } from "./image-lock.js";
+import { imageLock, imageReference } from "./image-lock.js";
 import { inspectDomainProxyConfiguration, renderDomainCaddyfile } from "./tls.js";
 import type { OwnedResource } from "./state.js";
 import { renderNatsAuthorization, type BootstrapCredentials } from "./credentials.js";
@@ -41,7 +41,7 @@ ${credentials ? renderNatsAuthorization(credentials) : ""}`;
   const composeYaml = `name: ${plan.composeProject}
 services:
   caddy:
-    image: caddy:${imageLock.caddy.tag}@${imageLock.caddy.digest}
+    image: ${imageReference(imageLock.caddy)}
     platform: linux/amd64
     restart: unless-stopped
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile"]
@@ -56,7 +56,7 @@ services:
       - fos-edge
       - fos-internal
   nats:
-    image: nats:${imageLock.nats.tag}@${imageLock.nats.digest}
+    image: ${imageReference(imageLock.nats)}
     platform: linux/amd64
     restart: unless-stopped
     command: ["-c", "/etc/nats/nats-server.conf"]

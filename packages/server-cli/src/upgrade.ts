@@ -1,4 +1,4 @@
-import { imageLock } from "./image-lock.js";
+import { imageLock, imageReference } from "./image-lock.js";
 import { nativeCompatibilityFor } from "./native-compatibility.js";
 import type { HostPlatform } from "./cli.js";
 import type { OwnedResource, OwnedStateManifest } from "./state.js";
@@ -47,8 +47,8 @@ async function target(adapter: UpgradeAdapter): Promise<UpgradeTarget> {
   return {
     mode: manifest.mode,
     images: [
-      `nats:${imageLock.nats.tag}@${imageLock.nats.digest}`,
-      `caddy:${imageLock.caddy.tag}@${imageLock.caddy.digest}`,
+      imageReference(imageLock.nats),
+      imageReference(imageLock.caddy),
     ],
   };
 }

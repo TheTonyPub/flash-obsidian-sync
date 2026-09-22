@@ -371,8 +371,8 @@ export function createLocalLifecycleAdapters(runtime: BootstrapRuntime, state: O
     const compose = "/opt/flash-osidian-sync/compose.yaml";
     const current = await runtime.readText(compose);
     const [nats, caddy] = target.images!;
-    const natsImage = /^\s*image:\s*nats:\S+$/m;
-    const caddyImage = /^\s*image:\s*caddy:\S+$/m;
+    const natsImage = /^\s*image:\s*(?:docker\.io\/library\/)?nats:\S+$/m;
+    const caddyImage = /^\s*image:\s*(?:docker\.io\/library\/)?caddy:\S+$/m;
     if (!natsImage.test(current) || !caddyImage.test(current)) throw new Error("COMPOSE_IMAGE_LOCK_NOT_FOUND");
     const candidate = current.replace(natsImage, `    image: ${nats}`).replace(caddyImage, `    image: ${caddy}`);
     if (candidate !== current) {

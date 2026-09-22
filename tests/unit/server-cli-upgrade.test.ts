@@ -43,7 +43,10 @@ describe("fos upgrade", () => {
     const composeState = { ...state, value: "/opt/flash-osidian-sync/state.json", manifest: { ...state.manifest!, mode: "docker" as const } };
     const host = adapter({ ownedState: vi.fn().mockResolvedValue(composeState), healthCheck: vi.fn().mockRejectedValue(new Error("WSS_HEALTH_FAILED")) });
     await expect(runUpgrade(host, { confirmed: true })).rejects.toThrow("WSS_HEALTH_FAILED");
-    expect(host.validate).toHaveBeenCalledWith(expect.objectContaining({ mode: "docker", images: expect.arrayContaining([expect.stringMatching(/@sha256:/)]) }));
+    expect(host.validate).toHaveBeenCalledWith(expect.objectContaining({ mode: "docker", images: [
+      "docker.io/library/nats:2.15.0@sha256:c0d27f3054601a99055aa5ec897b0a55bf1869ae50f454e659acfbbea11d2ab7",
+      "docker.io/library/caddy:2.11.4@sha256:df7f1c2fb114453b951de51a98efc010db1655a92c2e86be6706714e2417a78d",
+    ] }));
     expect(host.rollback).toHaveBeenCalledWith(await host.snapshot.mock.results[0]!.value);
   });
 
@@ -120,7 +123,7 @@ describe("local upgrade adapter", () => {
   it("accepts an already pinned Compose file without rewriting it", async () => {
     const manifest = { ...state.manifest!, mode: "docker" as const, resources: { paths: ["/opt/flash-osidian-sync/compose.yaml", "/opt/flash-osidian-sync/state.json"], services: [], ports: ["80", "443"], composeProject: "flash-osidian-sync" as const } };
     const stateAdapter: OwnedStateAdapter = { inventory: vi.fn().mockResolvedValue([{ ...state, value: "/opt/flash-osidian-sync/state.json", manifest }]), writeStateAtomically: vi.fn() };
-    const pinned = "services:\n  nats:\n    image: nats:2.15.0@sha256:c0d27f3054601a99055aa5ec897b0a55bf1869ae50f454e659acfbbea11d2ab7\n  caddy:\n    image: caddy:2.11.4@sha256:df7f1c2fb114453b951de51a98efc010db1655a92c2e86be6706714e2417a78d\n";
+    const pinned = "services:\n  nats:\n    image: docker.io/library/nats:2.15.0@sha256:c0d27f3054601a99055aa5ec897b0a55bf1869ae50f454e659acfbbea11d2ab7\n  caddy:\n    image: docker.io/library/caddy:2.11.4@sha256:df7f1c2fb114453b951de51a98efc010db1655a92c2e86be6706714e2417a78d\n";
     const runtime = { uid: () => 0, run: vi.fn().mockResolvedValue(""), pathInfo: vi.fn(), readText: vi.fn().mockResolvedValue(pinned), mkdir: vi.fn(), writeText: vi.fn(), rename: vi.fn(), remove: vi.fn(), randomId: () => "test", resolveDomain: vi.fn().mockResolvedValue(["203.0.113.1"]), portReachable: vi.fn().mockResolvedValue(true), verifyCertificate: vi.fn().mockResolvedValue(true), verifyWss: vi.fn().mockResolvedValue(true) } as unknown as BootstrapRuntime;
     await runUpgrade(createLocalLifecycleAdapters(runtime, stateAdapter).upgrade, { confirmed: true });
     expect(runtime.writeText).not.toHaveBeenCalled();
