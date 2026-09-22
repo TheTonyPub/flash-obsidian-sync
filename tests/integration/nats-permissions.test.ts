@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -38,9 +38,10 @@ async function freePort(): Promise<number> {
 const cleanups: Array<() => Promise<void>> = [];
 afterAll(async () => { for (const cleanup of cleanups.reverse()) await cleanup(); });
 
-it("isolates two vault KV buckets and rejects absent, wrong, and revoked credentials", async () => {
+it("on pinned NATS 2.15.0, isolates two vault KV buckets and rejects absent, wrong, and revoked credentials", async () => {
   const executable = process.env.NATS_SERVER_BIN;
   if (!executable) throw new Error("Set NATS_SERVER_BIN to the disposable test nats-server binary");
+  expect(execFileSync(executable, ["--version"], { encoding: "utf8" })).toContain("v2.15.0");
   const directory = await mkdtemp(join(tmpdir(), "easy-sync-permissions-"));
   const config = join(directory, "nats.conf");
   const port = await freePort();

@@ -1,0 +1,16 @@
+{
+  "name": "@flash-osidian-sync/server-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "fos": "dist/main.js"
+  },
+  "files": [
+    "dist/main.js",
+    "dist/admin-worker.js"
+  ],
+  "devDependencies": {
+    "bcryptjs": "^2.4.3"
+  }
+}

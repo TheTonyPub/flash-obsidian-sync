@@ -1,4 +1,4 @@
-import { sha256Hex, type BlobReference } from "@easy-sync/protocol";
+import { sha256Hex, type BlobReference } from "@flash-osidian-sync/protocol";
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
 export const DEFAULT_INLINE_LIMIT = 512 * 1024;

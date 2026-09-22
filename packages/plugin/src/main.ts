@@ -1,13 +1,14 @@
 import { EditorView } from "@codemirror/view";
 import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, SecretComponent, Setting, TFile } from "obsidian";
 import QRCode from "qrcode";
-import { normalizePath } from "@easy-sync/protocol";
+import { normalizePath } from "@flash-osidian-sync/protocol";
 import { connectExistingNatsBucket, connectVault, SyncStatus, statusSummary, type KvPort } from "./connection.js";
 import { LocalStore } from "./local-store.js";
 import { MarkdownSyncEngine, type MarkdownVault } from "./markdown-sync.js";
 import { connectS3Blob, DEFAULT_INLINE_LIMIT, type BlobPort } from "./blob-storage.js";
 import { createLogger, errorSummary } from "./diagnostics.js";
 import { decryptTransfer, encryptTransfer, type TransferConfig } from "./config-transfer.js";
+import { LEGACY_PLUGIN_ID, PLUGIN_ID, copyIndexedDbDatabase, deleteIndexedDbDatabase, indexedDbExists, migrateLegacyPluginData, registerImportUriHandlers, type LegacyMigrationMarker } from "./plugin-id-migration.js";
 
 interface EasySyncSettings {
   vaultId: string;
@@ -23,6 +24,7 @@ interface EasySyncSettings {
   s3SecretKeySecretKey: string;
   inlineLimit: number;
   debugLogging: boolean;
+  legacyMigration?: LegacyMigrationMarker;
 }
 
 function validIncluded(path: string): boolean {
@@ -119,6 +121,39 @@ export default class EasySyncPlugin extends Plugin {
   private readonly logger = createLogger(() => this.config?.debugLogging ?? false);
 
   async onload(): Promise<void> {
+    if (this.legacyPluginIsEnabled()) {
+      new Notice("Flash Osidian Sync migration paused: disable easy-sync before starting this plugin.");
+      return;
+    }
+    try {
+      let copiedTarget = "";
+      let newSettingsWriteAttempted = false;
+      await migrateLegacyPluginData({
+        loadPluginData: async (pluginId: string) => pluginId === PLUGIN_ID
+          ? (await this.loadData()) as Record<string, unknown> | null
+          : this.loadLegacyData(pluginId),
+        savePluginData: async (pluginId: string, data: Record<string, unknown>) => {
+          if (pluginId !== PLUGIN_ID) throw new Error("attempted to write legacy plugin data");
+          newSettingsWriteAttempted = true;
+          await this.saveData(data);
+        },
+        indexedDbExists,
+        copyIndexedDb: async (source: string, target: string) => {
+          await copyIndexedDbDatabase(source, target);
+          copiedTarget = target;
+        },
+        rollback: async () => {
+          if (copiedTarget) await deleteIndexedDbDatabase(copiedTarget);
+          // This invocation began without any new settings; clearing only this
+          // attempted write makes a partial save retryable without touching the
+          // legacy plugin's data or its SecretStorage entries.
+          if (newSettingsWriteAttempted) await this.saveData(null);
+        },
+      });
+    } catch (error) {
+      new Notice(`Flash Osidian Sync migration failed: ${errorSummary(error)}`);
+      return;
+    }
     const saved = (await this.loadData()) as Partial<EasySyncSettings> | null;
     this.config = {
       vaultId: saved?.vaultId || crypto.randomUUID().replaceAll("-", "").toUpperCase(),
@@ -134,15 +169,18 @@ export default class EasySyncPlugin extends Plugin {
       s3SecretKeySecretKey: saved?.s3SecretKeySecretKey ?? "",
       inlineLimit: saved?.inlineLimit ?? DEFAULT_INLINE_LIMIT,
       debugLogging: saved?.debugLogging ?? false,
+      legacyMigration: saved?.legacyMigration,
     };
     await this.saveSettings();
     const statusBar = this.addStatusBarItem();
-    this.register(this.status.subscribe(() => statusBar.setText(`easy-sync: ${statusSummary(this.status)}`)));
-    statusBar.setText(`easy-sync: ${statusSummary(this.status)}`);
+    this.register(this.status.subscribe(() => statusBar.setText(`${PLUGIN_ID}: ${statusSummary(this.status)}`)));
+    statusBar.setText(`${PLUGIN_ID}: ${statusSummary(this.status)}`);
     this.settingsTab = new EasySyncSettingTab(this.app, this);
     this.addSettingTab(this.settingsTab);
-    this.registerObsidianProtocolHandler("easy-sync-import", (params) => {
-      new ImportConfigModal(this.app, this, params.data ?? "").open();
+    registerImportUriHandlers(((scheme, handler) => {
+      this.registerObsidianProtocolHandler(scheme, handler as never);
+    }), (data) => {
+      new ImportConfigModal(this.app, this, data).open();
     });
     this.registerEditorExtension(EditorView.updateListener.of((update) => {
       if (!update.docChanged || !this.engine) return;
@@ -158,6 +196,21 @@ export default class EasySyncPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     await this.disconnect();
+  }
+
+  private legacyPluginIsEnabled(): boolean {
+    const enabled = (this.app as App & { plugins?: { enabledPlugins?: Set<string> } }).plugins?.enabledPlugins;
+    return enabled?.has(LEGACY_PLUGIN_ID) ?? false;
+  }
+
+  private async loadLegacyData(pluginId: string): Promise<Record<string, unknown> | null> {
+    if (pluginId !== LEGACY_PLUGIN_ID) return null;
+    const adapter = this.app.vault.adapter;
+    const path = normalizePath(`${this.app.vault.configDir}/plugins/${pluginId}/data.json`);
+    if (!(await adapter.exists(path))) return null;
+    const raw = await adapter.read(path);
+    const data: unknown = JSON.parse(raw);
+    return data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : null;
   }
 
   async saveSettings(): Promise<void> {
@@ -184,9 +237,9 @@ export default class EasySyncPlugin extends Plugin {
       throw new Error("This device is bound to a different vault");
     }
     await this.disconnect();
-    const natsKey = `easy-sync-nats-${crypto.randomUUID()}`;
+    const natsKey = `${PLUGIN_ID}-nats-${crypto.randomUUID()}`;
     this.app.secretStorage.setSecret(natsKey, transfer.natsPassword);
-    const s3Key = transfer.s3SecretKey ? `easy-sync-s3-${crypto.randomUUID()}` : "";
+    const s3Key = transfer.s3SecretKey ? `${PLUGIN_ID}-s3-${crypto.randomUUID()}` : "";
     if (s3Key) this.app.secretStorage.setSecret(s3Key, transfer.s3SecretKey);
     Object.assign(this.config, {
       vaultId: transfer.vaultId, server: transfer.server, username: transfer.username, passwordSecretKey: natsKey,
@@ -228,7 +281,7 @@ export default class EasySyncPlugin extends Plugin {
     this.status.refresh();
     this.logger.debug("plugin.connect", { vaultId: config.vaultId, bucket: `OBS_${config.vaultId}_FILES` });
     if (config.boundVaultId && config.boundVaultId !== config.vaultId) {
-      new Notice("easy-sync: vault binding cannot be changed");
+      new Notice(`${PLUGIN_ID}: vault binding cannot be changed`);
       return;
     }
     try {
@@ -238,7 +291,7 @@ export default class EasySyncPlugin extends Plugin {
       }, { getSecret: async (key) => this.app.secretStorage.getSecret(key) },
       (options, bucket, status) => connectExistingNatsBucket(options, bucket, status, this.logger), this.status);
       this.kv = kv;
-      const store = await LocalStore.open(`easy-sync-${config.deviceId}-${config.vaultId}`);
+      const store = await LocalStore.open(`${PLUGIN_ID}-${config.deviceId}-${config.vaultId}`);
       this.store = store;
       if (config.s3Endpoint && config.s3Bucket && config.s3AccessKeyId && config.s3SecretKeySecretKey) {
         try {
@@ -250,7 +303,7 @@ export default class EasySyncPlugin extends Plugin {
           this.status.markError("s3-config");
           this.status.lastError = errorSummary(error);
           this.logger.error("s3.connect_failed", error);
-          new Notice(`easy-sync S3: ${this.status.lastError}`);
+          new Notice(`${PLUGIN_ID} S3: ${this.status.lastError}`);
         }
       }
       const engine = new MarkdownSyncEngine({ deviceId: config.deviceId, vaultId: config.vaultId,
@@ -268,7 +321,7 @@ export default class EasySyncPlugin extends Plugin {
       this.status.lastError = errorSummary(error);
       this.status.refresh();
       this.logger.error("plugin.connect_failed", error, { vaultId: config.vaultId, bucket: `OBS_${config.vaultId}_FILES` });
-      new Notice(`easy-sync: ${this.status.lastError.slice(0, 220)}`);
+      new Notice(`${PLUGIN_ID}: ${this.status.lastError.slice(0, 220)}`);
     }
   }
 }
@@ -279,7 +332,7 @@ class ExportConfigModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Transfer easy-sync settings" });
+    contentEl.createEl("h2", { text: `Transfer ${PLUGIN_ID} settings` });
     contentEl.createEl("p", { text: "Set a code phrase of at least 8 characters. The QR contains encrypted NATS and S3 credentials. Enter the phrase separately on your iPhone." });
     let phrase = "";
     const result = contentEl.createDiv();
@@ -289,9 +342,9 @@ class ExportConfigModal extends Modal {
       result.empty();
       try {
         const payload = await this.plugin.exportConfig(phrase);
-        const uri = `obsidian://easy-sync-import?data=${encodeURIComponent(payload)}`;
+        const uri = `obsidian://${PLUGIN_ID}-import?data=${encodeURIComponent(payload)}`;
         const image = await QRCode.toDataURL(uri, { errorCorrectionLevel: "M", margin: 2, width: 400 });
-        result.createEl("img", { attr: { src: image, alt: "Encrypted easy-sync settings QR" } });
+        result.createEl("img", { attr: { src: image, alt: `Encrypted ${PLUGIN_ID} settings QR` } });
         result.createEl("p", { text: "Scan with iPhone Camera. Open the Obsidian link, then enter the code phrase." });
         new Setting(result).addButton((copy) => copy.setButtonText("Copy transfer link").onClick(async () => {
           await navigator.clipboard.writeText(uri);
@@ -310,7 +363,7 @@ class ImportConfigModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Import easy-sync settings" });
+    contentEl.createEl("h2", { text: `Import ${PLUGIN_ID} settings` });
     let payload = this.initialPayload;
     let phrase = "";
     const result = contentEl.createDiv();
@@ -326,7 +379,7 @@ class ImportConfigModal extends Modal {
         const transfer = await decryptTransfer(payload, phrase);
         await this.plugin.importConfig(transfer);
         this.close();
-        new Notice("easy-sync settings imported");
+        new Notice(`${PLUGIN_ID} settings imported`);
       } catch (error) {
         result.createEl("p", { text: `Unable to import: ${errorSummary(error)}` });
       } finally { button.setDisabled(false); }
@@ -356,6 +409,7 @@ class EasySyncSettingTab extends PluginSettingTab {
         .setValue(settings.passwordSecretKey)
         .onChange(async (value) => { settings.passwordSecretKey = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("S3 HTTPS endpoint")
+      .setDesc("Optional. Leave all S3 fields empty for Markdown-only sync; images and oversized files stay local until configured.")
       .addText((text) => text.setValue(settings.s3Endpoint).onChange(async (value) => {
         settings.s3Endpoint = value.trim(); await this.plugin.saveSettings();
       }));

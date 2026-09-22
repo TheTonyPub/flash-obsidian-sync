@@ -1,4 +1,4 @@
-import { sha256Hex } from "@easy-sync/protocol";
+import { sha256Hex } from "@flash-osidian-sync/protocol";
 import { diff3Merge } from "node-diff3";
 
 function lines(content: string): string[] {

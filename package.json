@@ -1,5 +1,5 @@
 {
-  "name": "easy-sync",
+  "name": "flash-osidian-sync",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -9,6 +9,9 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "build:plugin": "esbuild packages/plugin/src/main.ts --bundle --platform=browser --format=cjs --target=es2022 --external:obsidian --external:@codemirror/view --outfile=packages/plugin/dist/main.js",
+    "build:server-cli": "node scripts/build-server-cli.mjs",
+    "test:server-cli-bundle": "npm run build:server-cli && vitest run tests/integration/server-cli-bundle.test.ts",
+    "build:server-admin-worker": "node scripts/build-server-cli.mjs worker",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration --passWithNoTests",

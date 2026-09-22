@@ -1,4 +1,4 @@
-import { createFileId, decodeRecord, encodeRecord, normalizePath, sha256Hex, type RemoteFileRecord } from "@easy-sync/protocol";
+import { createFileId, decodeRecord, encodeRecord, normalizePath, sha256Hex, type RemoteFileRecord } from "@flash-osidian-sync/protocol";
 import { type KvPort, type SyncStatus } from "./connection.js";
 import { type FileIndexEntry, type LocalStore, type OutboxOperation } from "./local-store.js";
 import { conflictCopyId, conflictCopyPath, resolveMarkdown } from "./conflict-resolution.js";
@@ -35,6 +35,10 @@ export function retryDelay(failures: number): number {
 }
 
 type Watched = { key: string; value: Uint8Array; revision: number };
+
+class BlobStorageUnavailableError extends Error {
+  constructor() { super("S3 storage is not configured; large files remain local and pending"); }
+}
 
 export class MarkdownSyncEngine {
   private stopWatch?: () => void;
@@ -344,6 +348,11 @@ export class MarkdownSyncEngine {
         status.clearError(`outbox:${operation.fileId}`);
       } catch (error) {
         status.lastError = errorSummary(error);
+        if (error instanceof BlobStorageUnavailableError) {
+          status.markError(`outbox:${operation.fileId}`);
+          blockedFiles.add(operation.fileId);
+          continue;
+        }
         this.options.logger?.error("outbox.publish_failed", error, { operationType: operation.type, retryCount: operation.retryCount });
         const nextAttemptAt = Date.now() + retryDelay(operation.retryCount);
         await store.markRetry(operation.operationId, String(error), nextAttemptAt);
@@ -410,7 +419,7 @@ export class MarkdownSyncEngine {
       let record: RemoteFileRecord;
       if (useBlob) {
         const blob = this.options.blob;
-        if (!blob || !this.options.vaultId) throw new Error("S3 blob settings required");
+        if (!blob || !this.options.vaultId) throw new BlobStorageUnavailableError();
         const key = blobObjectKey(this.options.vaultId, common.contentHash);
         this.options.status.blobsPending++;
         this.options.status.refresh();
