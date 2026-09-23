@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { addVaultUser, revokeVaultUser, rotateVaultUser, type ManagedAuthorization, type ManagedVaultUser, type VaultUserAdapter } from "../../packages/server-cli/src/vault-users.js";
 import { runVaultCommand, type HostAdapter } from "../../packages/server-cli/src/cli.js";
+import type { VaultVerificationAdapter } from "../../packages/server-cli/src/vault-verify.js";
 
 const administrator = { username: "fos-admin", password: "admin-secret" };
 const notes: ManagedVaultUser = { vaultId: "notes", username: "fos-vault-notes", passwordHash: "$2a$12$notes" };
@@ -105,13 +106,21 @@ describe("fos vault user lifecycle", () => {
   it("accepts only root-protected administrator input and writes new credentials to protected output", async () => {
     const host = adapter();
     const output = { writeFileAtomically: vi.fn().mockResolvedValue(undefined) };
+    const verification: VaultVerificationAdapter = {
+      authenticate: vi.fn().mockResolvedValue(true),
+      status: vi.fn().mockResolvedValue(undefined),
+      put: vi.fn().mockResolvedValue(undefined),
+      get: vi.fn().mockResolvedValue(new TextEncoder().encode("fos-verify")),
+      watch: vi.fn().mockResolvedValue(vi.fn()),
+      crossBucketDenied: vi.fn().mockResolvedValue(true),
+    };
     const inputHost: HostAdapter = {
       platform: () => ({ distribution: "debian", release: "13", architecture: "amd64" }),
       readProtectedInput: vi.fn().mockResolvedValue({ content: "admin-secret\n", uid: 0, mode: 0o600 }),
     };
 
-    await runVaultCommand(["add", "--mode", "native", "--vault-id", "notes", "--admin-input", "/root/admin", "--secrets-output", "/root/new"], {
-      host: inputHost, createAdapter: () => host, secretOutput: output,
+    await runVaultCommand(["add", "--mode", "native", "--vault-id", "notes", "--admin-input", "/root/admin", "--secrets-output", "/root/new", "--wss-endpoint", "wss://managed.example.test"], {
+      host: inputHost, createAdapter: () => host, createVerificationAdapter: () => verification, secretOutput: output,
     });
 
     expect(output.writeFileAtomically).toHaveBeenCalledWith("/root/new", expect.stringContaining("Vault password:"), { owner: 0, mode: 0o600 });

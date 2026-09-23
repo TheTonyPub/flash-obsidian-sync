@@ -10,6 +10,9 @@
     "dist/main.js",
     "dist/admin-worker.js"
   ],
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
   "devDependencies": {
     "bcryptjs": "^2.4.3"
   }

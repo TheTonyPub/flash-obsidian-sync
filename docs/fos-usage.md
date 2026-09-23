@@ -10,7 +10,7 @@ Start by reviewing the selected plan, then run the guided installer:
 
 ```sh
 sudo fos plan
-sudo fos bootstrap
+sudo fos bootstrap --wss-endpoint wss://sync.example.com --keep
 ```
 
 The interactive flow asks for native, Docker Compose, or Podman Compose mode, the domain, the first vault ID, and optional operations such as firewall and backup management. It displays a redacted plan and asks before making host changes. First bootstrap creates a random NATS administrator credential and a separate first-vault credential. Save both from the protected handoff; the administrator credential is required for future bucket and user management, while only the vault credential belongs in Obsidian.
@@ -25,7 +25,25 @@ sudo fos bootstrap --non-interactive \
 sudo chmod 600 /root/fos-secrets.json
 ```
 
-Do not put passwords in command arguments, shell history, repositories, or normal logs. Protect and remove secret files according to your server's credential-handling policy after securely recording the values.
+Do not put passwords, import links, QR text, or encryption phrases in command arguments, shell history, repositories, or normal logs. Protect and remove secret files according to your server's credential-handling policy after securely recording the values.
+
+## Vault handoff and recovery
+
+After successful bootstrap, `fos vault add`, or `fos vault rotate`, `fos` emits a vault-only Obsidian import URI and terminal QR code through the same protected handoff as the generated vault credential. It never includes the administrator credential. Obsidian stores the imported NATS password and any S3 secret in SecretStorage; ordinary plugin settings store opaque secret keys.
+
+`--wss-endpoint wss://host` is validated before a credential changes and overrides the managed bootstrap endpoint. Without an override, `fos` uses the managed bootstrap endpoint; an interactive command prompts if none exists, while unattended operation fails before a mutation. `vault create` only creates a bucket and does not issue a handoff.
+
+Use `--keep` with bootstrap, vault add, or rotation to retain the newly generated vault plaintext credential in the protected local store. Bootstrap always retains its separate administrator credential. Without `--keep`, the vault password is available only in the one-time handoff. Regenerate a retained vault handoff locally, without contacting the server:
+
+```sh
+sudo fos import --vault-id VAULT_ID
+```
+
+`fos import` accepts `--wss-endpoint` for an endpoint migration. In unattended use, add a root-only `--secrets-output PATH`; it never writes the URI or QR to ordinary stdout. If no retained vault credential exists, rotate that vault with `--keep`; NATS password hashes cannot recover the old password.
+
+Press Enter at the optional handoff phrase prompt to create explicit plaintext version 2. A nonempty phrase must have at least eight characters and creates encrypted version 1. Treat either URI or QR as a password-bearing secret; store the phrase separately when encryption is used.
+
+After a rotation, import the new handoff on each device; the old credential no longer authenticates. Revoking a vault user removes only that vault's retained record after successful server revocation, so later `fos import` requires a new rotation with `--keep`.
 
 ## Day-to-day commands
 
@@ -39,7 +57,7 @@ sudo fos backup --destination /srv/flash-osidian-sync-backups --retention 7
 sudo fos restore-check --destination /srv/flash-osidian-sync-backups --retention 7
 ```
 
-Vault creation, inspection, rotation, revocation, listing, and other KV management require administrator authentication through an interactive prompt or protected input. `vault verify` requires the vault password and checks that vault's own scoped access; cross-vault isolation is only tested when an existing peer is explicitly identified and administrator authentication is provided. Use `--admin-input` and `--vault-input` only with protected files; generated passwords for add/rotate go to a protected `--secrets-output` file in unattended operation. `backup` and `restore-check` require an explicit destination and retention count.
+Vault creation, inspection, rotation, revocation, listing, and other KV management require administrator authentication through an interactive prompt or protected input. `vault verify` requires the vault password and checks that vault's own scoped access; cross-vault isolation is only tested when an existing peer is explicitly identified and administrator authentication is provided. Use `--admin-input` and `--vault-input` only with protected files; generated passwords and handoffs for add/rotate go to a protected `--secrets-output` file in unattended operation. `backup` and `restore-check` require an explicit destination and retention count.
 
 `fos upgrade` and `fos uninstall` show a preview by default. Add `--approve` only after reviewing the preview. Uninstall preserves data by default; deleting it requires the separate `--delete-data` and exact confirmation options documented by that CLI version.
 

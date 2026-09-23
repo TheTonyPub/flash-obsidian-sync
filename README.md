@@ -97,7 +97,7 @@ Realised:
 
 Planned:
 
-- [ ] Generate an Obsidian import link for vault credentials from the `fos` bootstrap CLI.
+- [x] Generate an Obsidian import link for vault credentials from the `fos` bootstrap CLI.
 - [ ] Add end-to-end encryption for synchronized data.
 - [ ] Back up vault content to a remote Git repository.
 - [ ] Monitor the NATS server and show usage statistics.
