@@ -18,7 +18,12 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build:plugin
-      - run: npm run test:unit
+      - run: npm run test:coverage
+      - name: Upload unit test coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage/lcov.info
+          flags: unit
       - name: Prepare disposable NATS server
         run: |
           curl -fsSL https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-linux-amd64.tar.gz -o "$RUNNER_TEMP/nats-server.tar.gz"

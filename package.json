@@ -18,6 +18,7 @@
     "build:server-admin-worker": "node scripts/build-server-cli.mjs worker",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
+    "test:coverage": "vitest run tests/unit --coverage",
     "test:integration": "vitest run tests/integration --exclude tests/integration/server-cli-bundle.test.ts --passWithNoTests",
     "test:simulation": "vitest run tests/simulation --passWithNoTests"
   },
@@ -27,6 +28,7 @@
     "@nats-io/transport-node": "^3.4.0",
     "@types/node": "^20.0.0",
     "@types/qrcode": "^1.5.6",
+    "@vitest/coverage-v8": "^2.1.9",
     "esbuild": "^0.25.0",
     "eslint": "^9.0.0",
     "fake-indexeddb": "^6.0.0",
