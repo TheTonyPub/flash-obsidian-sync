@@ -9,7 +9,7 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     env:
-      PUBLISH_COVERAGE_BADGE: ${{ secrets.GIST_ID != '' && secrets.GIST_TOKEN != '' }}
+      PUBLISH_COVERAGE_BADGE: ${{ secrets.GIST_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -28,13 +28,13 @@ jobs:
         if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
         uses: gaelgirodon/ci-badges-action@v1
         with:
-          gist-id: ${{ secrets.GIST_ID }}
+          gist-id: 26e423a64b46c4ca558901a40f9c9e3d
           token: ${{ secrets.GIST_TOKEN }}
       - name: Verify coverage badge was published
         if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
         env:
           GH_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_ID: 26e423a64b46c4ca558901a40f9c9e3d
         run: |
           updated_at=$(gh api "/gists/$GIST_ID" --jq .updated_at)
           if [[ "$updated_at" < "$BADGE_PUBLISH_STARTED_AT" ]]; then
