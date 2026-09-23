@@ -21,12 +21,26 @@ jobs:
       - run: npm run lint
       - run: npm run build:plugin
       - run: npm run test:coverage
+      - name: Record badge publish start
+        if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+        run: echo "BADGE_PUBLISH_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       - name: Publish unit test coverage badge
         if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
         uses: gaelgirodon/ci-badges-action@v1
         with:
           gist-id: ${{ secrets.GIST_ID }}
           token: ${{ secrets.GIST_TOKEN }}
+      - name: Verify coverage badge was published
+        if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          updated_at=$(gh api "/gists/$GIST_ID" --jq .updated_at)
+          if [[ "$updated_at" < "$BADGE_PUBLISH_STARTED_AT" ]]; then
+            echo "Coverage badge Gist was not updated by this run" >&2
+            exit 1
+          fi
       - name: Prepare disposable NATS server
         run: |
           curl -fsSL https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-linux-amd64.tar.gz -o "$RUNNER_TEMP/nats-server.tar.gz"
