@@ -15,7 +15,6 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build:plugin
-      - run: npm run build:server-cli
       - run: npm run test:unit
       - name: Prepare disposable NATS server
         run: |
