@@ -1,6 +1,6 @@
 # obsidian-flash-sync
 
-[![Unit test coverage](https://codecov.io/gh/TheTonyPub/obsidian-flash-sync/branch/dev/graph/badge.svg)](https://codecov.io/gh/TheTonyPub/obsidian-flash-sync)
+[![Unit test coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2FTheTonyPub%2F26e423a64b46c4ca558901a40f9c9e3d%2Fraw%2Fobsidian-flash-sync-lcov-coverage.json)](https://gist.github.com/TheTonyPub/26e423a64b46c4ca558901a40f9c9e3d)
 [![CI build](https://github.com/TheTonyPub/obsidian-flash-sync/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/TheTonyPub/obsidian-flash-sync/actions/workflows/ci.yml?query=branch%3Adev)
 [![Latest stable release](https://img.shields.io/github/v/release/TheTonyPub/obsidian-flash-sync)](https://github.com/TheTonyPub/obsidian-flash-sync/releases/latest)
 

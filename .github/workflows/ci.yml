@@ -8,6 +8,8 @@ on:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    env:
+      PUBLISH_COVERAGE_BADGE: ${{ secrets.GIST_ID != '' && secrets.GIST_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,11 +21,12 @@ jobs:
       - run: npm run lint
       - run: npm run build:plugin
       - run: npm run test:coverage
-      - name: Upload unit test coverage
-        uses: codecov/codecov-action@v5
+      - name: Publish unit test coverage badge
+        if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+        uses: gaelgirodon/ci-badges-action@v1
         with:
-          files: ./coverage/lcov.info
-          flags: unit
+          gist-id: ${{ secrets.GIST_ID }}
+          token: ${{ secrets.GIST_TOKEN }}
       - name: Prepare disposable NATS server
         run: |
           curl -fsSL https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-linux-amd64.tar.gz -o "$RUNNER_TEMP/nats-server.tar.gz"
