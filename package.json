@@ -1,7 +1,11 @@
 {
-  "name": "flash-osidian-sync",
+  "name": "obsidian-flash-sync",
   "private": true,
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TheTonyPub/obsidian-flash-sync.git"
+  },
   "workspaces": [
     "packages/*"
   ],

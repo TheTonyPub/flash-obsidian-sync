@@ -17,8 +17,8 @@ The CLI rejects OS/package combinations outside the compatibility lock shipped w
 On the target server, clone the repository and build its server CLI bundle:
 
 ```sh
-git clone https://github.com/TheTonyPub/flash-obsidian-sync.git
-cd flash-obsidian-sync
+git clone https://github.com/TheTonyPub/obsidian-flash-sync.git
+cd obsidian-flash-sync
 npm ci
 npm run build:server-cli
 ```
@@ -39,7 +39,7 @@ The workspace package includes the built `fos` entry point and its admin worker.
 Keep the clone as the source checkout. To update the global executable:
 
 ```sh
-cd flash-obsidian-sync
+cd obsidian-flash-sync
 git pull --ff-only
 npm ci
 npm run build:server-cli
