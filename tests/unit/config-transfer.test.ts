@@ -32,7 +32,7 @@ describe("encrypted configuration transfer", () => {
 
   it("fits a normal encrypted transfer link into a QR code", async () => {
     const payload = await encryptTransfer(config, "correct horse battery staple");
-    const svg = await QRCode.toString(`obsidian://easy-sync-import?data=${encodeURIComponent(payload)}`, { type: "svg" });
+    const svg = await QRCode.toString(`obsidian://flash-sync-import?data=${encodeURIComponent(payload)}`, { type: "svg" });
     expect(svg).toContain("<svg");
   });
 });

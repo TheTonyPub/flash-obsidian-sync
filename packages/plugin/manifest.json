@@ -1,9 +1,9 @@
 {
-  "id": "flash-osidian-sync",
-  "name": "flash-osidian-sync",
+  "id": "flash-sync",
+  "name": "flash-sync",
   "version": "0.1.3",
   "minAppVersion": "1.11.4",
   "description": "Self-hosted vault synchronization.",
-  "author": "flash-osidian-sync contributors",
+  "author": "flash-sync contributors",
   "isDesktopOnly": false
 }

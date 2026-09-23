@@ -33,10 +33,10 @@ export function errorSummary(error: unknown): string {
 export function createLogger(debugEnabled: () => boolean, sink: Pick<Console, "debug" | "error"> = console): PluginLogger {
   return {
     debug(event, fields) {
-      if (debugEnabled()) sink.debug(`[flash-osidian-sync] ${event}`, fields ?? {});
+      if (debugEnabled()) sink.debug(`[flash-sync] ${event}`, fields ?? {});
     },
     error(event, cause, fields) {
-      sink.error(`[flash-osidian-sync] ${event}: ${errorSummary(cause)}`, fields ?? {});
+      sink.error(`[flash-sync] ${event}: ${errorSummary(cause)}`, fields ?? {});
     },
   };
 }

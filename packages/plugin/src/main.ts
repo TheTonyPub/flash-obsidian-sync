@@ -8,7 +8,7 @@ import { MarkdownSyncEngine, type MarkdownVault } from "./markdown-sync.js";
 import { connectS3Blob, DEFAULT_INLINE_LIMIT, type BlobPort } from "./blob-storage.js";
 import { createLogger, errorSummary } from "./diagnostics.js";
 import { decryptTransfer, encryptTransfer, type TransferConfig } from "./config-transfer.js";
-import { LEGACY_PLUGIN_ID, PLUGIN_ID, copyIndexedDbDatabase, deleteIndexedDbDatabase, indexedDbExists, migrateLegacyPluginData, registerImportUriHandlers, type LegacyMigrationMarker } from "./plugin-id-migration.js";
+import { PLUGIN_ID, registerImportUriHandlers } from "./plugin-identity.js";
 
 interface EasySyncSettings {
   vaultId: string;
@@ -24,7 +24,6 @@ interface EasySyncSettings {
   s3SecretKeySecretKey: string;
   inlineLimit: number;
   debugLogging: boolean;
-  legacyMigration?: LegacyMigrationMarker;
 }
 
 function validIncluded(path: string): boolean {
@@ -121,39 +120,6 @@ export default class EasySyncPlugin extends Plugin {
   private readonly logger = createLogger(() => this.config?.debugLogging ?? false);
 
   async onload(): Promise<void> {
-    if (this.legacyPluginIsEnabled()) {
-      new Notice("Flash Osidian Sync migration paused: disable easy-sync before starting this plugin.");
-      return;
-    }
-    try {
-      let copiedTarget = "";
-      let newSettingsWriteAttempted = false;
-      await migrateLegacyPluginData({
-        loadPluginData: async (pluginId: string) => pluginId === PLUGIN_ID
-          ? (await this.loadData()) as Record<string, unknown> | null
-          : this.loadLegacyData(pluginId),
-        savePluginData: async (pluginId: string, data: Record<string, unknown>) => {
-          if (pluginId !== PLUGIN_ID) throw new Error("attempted to write legacy plugin data");
-          newSettingsWriteAttempted = true;
-          await this.saveData(data);
-        },
-        indexedDbExists,
-        copyIndexedDb: async (source: string, target: string) => {
-          await copyIndexedDbDatabase(source, target);
-          copiedTarget = target;
-        },
-        rollback: async () => {
-          if (copiedTarget) await deleteIndexedDbDatabase(copiedTarget);
-          // This invocation began without any new settings; clearing only this
-          // attempted write makes a partial save retryable without touching the
-          // legacy plugin's data or its SecretStorage entries.
-          if (newSettingsWriteAttempted) await this.saveData(null);
-        },
-      });
-    } catch (error) {
-      new Notice(`Flash Osidian Sync migration failed: ${errorSummary(error)}`);
-      return;
-    }
     const saved = (await this.loadData()) as Partial<EasySyncSettings> | null;
     this.config = {
       vaultId: saved?.vaultId || crypto.randomUUID().replaceAll("-", "").toUpperCase(),
@@ -169,7 +135,6 @@ export default class EasySyncPlugin extends Plugin {
       s3SecretKeySecretKey: saved?.s3SecretKeySecretKey ?? "",
       inlineLimit: saved?.inlineLimit ?? DEFAULT_INLINE_LIMIT,
       debugLogging: saved?.debugLogging ?? false,
-      legacyMigration: saved?.legacyMigration,
     };
     await this.saveSettings();
     const statusBar = this.addStatusBarItem();
@@ -196,21 +161,6 @@ export default class EasySyncPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     await this.disconnect();
-  }
-
-  private legacyPluginIsEnabled(): boolean {
-    const enabled = (this.app as App & { plugins?: { enabledPlugins?: Set<string> } }).plugins?.enabledPlugins;
-    return enabled?.has(LEGACY_PLUGIN_ID) ?? false;
-  }
-
-  private async loadLegacyData(pluginId: string): Promise<Record<string, unknown> | null> {
-    if (pluginId !== LEGACY_PLUGIN_ID) return null;
-    const adapter = this.app.vault.adapter;
-    const path = normalizePath(`${this.app.vault.configDir}/plugins/${pluginId}/data.json`);
-    if (!(await adapter.exists(path))) return null;
-    const raw = await adapter.read(path);
-    const data: unknown = JSON.parse(raw);
-    return data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : null;
   }
 
   async saveSettings(): Promise<void> {
