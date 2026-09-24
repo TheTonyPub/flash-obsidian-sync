@@ -11,7 +11,7 @@ import { MarkdownSyncEngine } from "../../packages/plugin/src/markdown-sync.js";
 import { indexedDBDouble, NatsKvDouble, VaultDouble } from "../doubles/index.js";
 
 const execFile = promisify(execFileCallback);
-const image = "quay.io/minio/minio:RELEASE.2025-02-18T16-25-55Z";
+const image = "docker.io/rustfs/rustfs@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff";
 const bytes = (value: string) => new TextEncoder().encode(value);
 
 async function freePort(): Promise<number> {
@@ -37,12 +37,12 @@ describe("disposable S3-compatible blob integration", () => {
     const port = await freePort();
     const endpoint = `http://127.0.0.1:${port}`;
     const { stdout } = await execFile("docker", ["run", "-d", "--rm", "-p", `127.0.0.1:${port}:9000`,
-      "-e", "MINIO_ROOT_USER=testadmin", "-e", "MINIO_ROOT_PASSWORD=testpassword123",
-      image, "server", "/data", "--console-address", ":9001"]);
+      "-e", "RUSTFS_VOLUMES=/data", "-e", "RUSTFS_ACCESS_KEY=testadmin", "-e", "RUSTFS_SECRET_KEY=testpassword123",
+      image]);
     containerId = stdout.trim();
     let ready = false;
-    for (let i = 0; i < 100; i++) {
-      try { ready = (await fetch(`${endpoint}/minio/health/live`)).ok; if (ready) break; }
+    for (let i = 0; i < 200; i++) {
+      try { ready = (await fetch(`${endpoint}/health/ready`)).ok; if (ready) break; }
       catch { /* Container is starting. */ }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
