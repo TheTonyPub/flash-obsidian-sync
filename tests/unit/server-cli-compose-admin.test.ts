@@ -25,6 +25,7 @@ describe("fos compose admin client", () => {
     });
     const [args, stdin] = runtime.runContainer.mock.calls[0]!;
     expect(args).toContain("docker.io/library/node:22.22.0-alpine@sha256:e4bf2a82ad0a4037d28035ae71529873c069b13eb0455466ae0bc13363826e34");
+    expect(args).toContain("--pull"); expect(args).toContain("missing");
     expect(args.join(" ")).not.toContain("secret");
     expect(args.join(" ")).toContain("readonly");
     expect(JSON.parse(stdin)).toMatchObject({ action: "create", username: "fos-admin", password: "secret", vaultId: "notes" });

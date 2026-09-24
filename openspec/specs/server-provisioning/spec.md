@@ -66,6 +66,21 @@ The `fos` CLI SHALL run on the target server and provide a guided interactive bo
 - **WHEN** the operator supplies a remote host target to the CLI
 - **THEN** the CLI rejects remote orchestration and instructs the operator to run it on the server, including through an existing SSH shell if desired
 
+#### Scenario: Interactive cancellation
+- **WHEN** the operator cancels an interactive prompt or plan confirmation
+- **THEN** the CLI restores terminal input and exits without applying the unconfirmed plan
+
+### Requirement: Clear terminal and machine-readable output
+The CLI SHALL provide command-specific help for root commands and nested vault actions. It SHALL use color only for interactive terminal output when color is enabled, and SHALL preserve plain text or explicitly requested JSON output when redirected or when color is disabled. Interactive choices SHALL explain available options and accept keyboard selection; output SHALL identify errors and relevant paths clearly.
+
+#### Scenario: Command-specific help
+- **WHEN** an operator requests help for a command or nested vault action
+- **THEN** the CLI prints that command's usage, options, and examples, then exits without contacting a service or changing the host
+
+#### Scenario: Redirected output
+- **WHEN** an operator redirects human-readable command output or requests JSON
+- **THEN** terminal color escapes are omitted and JSON output remains valid machine-readable JSON
+
 ### Requirement: Selectable installation modes
 The CLI SHALL support native NATS and Caddy services, Docker Compose, and Podman Compose. Every mode SHALL generate and validate equivalent NATS and Caddy behavior: persistent JetStream data, hashed administrator and vault users, a private NATS client listener for server-local management, a private NATS WebSocket upstream, and a Caddy-terminated domain WSS endpoint. Only Caddy TCP 80/443 SHALL be publicly reachable. Native NATS SHALL bind its client and WebSocket listeners to loopback; Compose SHALL place NATS on an internal network without host-published NATS ports. No mode SHALL configure or expose NATS monitoring port 8222 in this change. Every mode SHALL report the external WSS URL. The CLI SHALL not install an S3 server.
 
@@ -76,6 +91,10 @@ The CLI SHALL support native NATS and Caddy services, Docker Compose, and Podman
 #### Scenario: Container deployment
 - **WHEN** the operator selects Docker Compose or Podman Compose
 - **THEN** the CLI validates the chosen runtime, deploys managed services with persistent storage and no host-published NATS ports, and retains a usable generated Compose configuration
+
+#### Scenario: Missing pinned administration image
+- **WHEN** a container-mode operation needs the pinned administration image and that image is absent locally
+- **THEN** the CLI obtains the pinned image before running the administration operation
 
 #### Scenario: Native deployment uses the same exposure policy
 - **WHEN** the operator selects native installation
@@ -120,7 +139,11 @@ Bootstrap SHALL separately offer firewall management, dedicated service accounts
 
 #### Scenario: Firewall choice is selected
 - **WHEN** the operator selects firewall management over an SSH session
-- **THEN** the CLI identifies the active SSH access path and requests explicit confirmation before changing rules
+- **THEN** the CLI identifies the active SSH access path and requests explicit confirmation before changing rules; it adds only the selected access and service allow rules and does not activate an inactive UFW firewall
+
+#### Scenario: Firewall is already active
+- **WHEN** the operator selects firewall management and UFW is active
+- **THEN** the CLI adds the required allow rules without broadening or replacing unrelated firewall rules
 
 #### Scenario: Backup choice is selected
 - **WHEN** the operator selects backups and provides a destination and retention policy

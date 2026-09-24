@@ -1,0 +1,56 @@
+name: Plugin tag release
+
+on:
+  push:
+    tags:
+      - "**"
+
+permissions:
+  contents: write
+
+jobs:
+  plugin-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: validate
+        id: validate
+        run: node scripts/plugin-release.mjs validate --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" --repo . --github-output "$GITHUB_OUTPUT"
+      - name: build
+        run: |
+          npm ci
+          npm run build:plugin
+          node scripts/plugin-release.mjs package --tag "$GITHUB_REF_NAME" --repo . --directory dist/plugin-release
+      - name: test
+        run: |
+          npm run typecheck
+          npm run lint
+          npm run test:unit
+          node scripts/plugin-release.mjs verify --tag "$GITHUB_REF_NAME" --directory dist/plugin-release
+      - name: release development artifact
+        if: steps.validate.outputs.channel == 'development'
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-sync-${{ github.ref_name }}
+          path: dist/plugin-release/*
+          if-no-files-found: error
+      - name: release stable or prerelease
+        if: steps.validate.outputs.channel != 'development'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHANNEL: ${{ steps.validate.outputs.channel }}
+        run: |
+          assets=(dist/plugin-release/main.js dist/plugin-release/manifest.json)
+          if [ -f dist/plugin-release/styles.css ]; then assets+=(dist/plugin-release/styles.css); fi
+          if [ "$RELEASE_CHANNEL" = "prerelease" ]; then
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" --verify-tag --title "$GITHUB_REF_NAME" --notes "Flash Sync prerelease for manual installation." --prerelease
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" --verify-tag --title "$GITHUB_REF_NAME" --notes "Flash Sync stable release."
+          fi

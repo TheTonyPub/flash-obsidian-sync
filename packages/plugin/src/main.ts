@@ -7,8 +7,8 @@ import { LocalStore } from "./local-store.js";
 import { MarkdownSyncEngine, type MarkdownVault } from "./markdown-sync.js";
 import { connectS3Blob, DEFAULT_INLINE_LIMIT, type BlobPort } from "./blob-storage.js";
 import { createLogger, errorSummary } from "./diagnostics.js";
-import { decryptTransfer, encryptTransfer, type TransferConfig } from "./config-transfer.js";
-import { LEGACY_PLUGIN_ID, PLUGIN_ID, copyIndexedDbDatabase, deleteIndexedDbDatabase, indexedDbExists, migrateLegacyPluginData, registerImportUriHandlers, type LegacyMigrationMarker } from "./plugin-id-migration.js";
+import { decryptTransfer, encryptTransfer, transferVersion, type TransferConfig } from "./config-transfer.js";
+import { PLUGIN_ID, registerImportUriHandlers } from "./plugin-identity.js";
 
 interface EasySyncSettings {
   vaultId: string;
@@ -24,7 +24,6 @@ interface EasySyncSettings {
   s3SecretKeySecretKey: string;
   inlineLimit: number;
   debugLogging: boolean;
-  legacyMigration?: LegacyMigrationMarker;
 }
 
 function validIncluded(path: string): boolean {
@@ -121,39 +120,6 @@ export default class EasySyncPlugin extends Plugin {
   private readonly logger = createLogger(() => this.config?.debugLogging ?? false);
 
   async onload(): Promise<void> {
-    if (this.legacyPluginIsEnabled()) {
-      new Notice("Flash Osidian Sync migration paused: disable easy-sync before starting this plugin.");
-      return;
-    }
-    try {
-      let copiedTarget = "";
-      let newSettingsWriteAttempted = false;
-      await migrateLegacyPluginData({
-        loadPluginData: async (pluginId: string) => pluginId === PLUGIN_ID
-          ? (await this.loadData()) as Record<string, unknown> | null
-          : this.loadLegacyData(pluginId),
-        savePluginData: async (pluginId: string, data: Record<string, unknown>) => {
-          if (pluginId !== PLUGIN_ID) throw new Error("attempted to write legacy plugin data");
-          newSettingsWriteAttempted = true;
-          await this.saveData(data);
-        },
-        indexedDbExists,
-        copyIndexedDb: async (source: string, target: string) => {
-          await copyIndexedDbDatabase(source, target);
-          copiedTarget = target;
-        },
-        rollback: async () => {
-          if (copiedTarget) await deleteIndexedDbDatabase(copiedTarget);
-          // This invocation began without any new settings; clearing only this
-          // attempted write makes a partial save retryable without touching the
-          // legacy plugin's data or its SecretStorage entries.
-          if (newSettingsWriteAttempted) await this.saveData(null);
-        },
-      });
-    } catch (error) {
-      new Notice(`Flash Osidian Sync migration failed: ${errorSummary(error)}`);
-      return;
-    }
     const saved = (await this.loadData()) as Partial<EasySyncSettings> | null;
     this.config = {
       vaultId: saved?.vaultId || crypto.randomUUID().replaceAll("-", "").toUpperCase(),
@@ -169,7 +135,6 @@ export default class EasySyncPlugin extends Plugin {
       s3SecretKeySecretKey: saved?.s3SecretKeySecretKey ?? "",
       inlineLimit: saved?.inlineLimit ?? DEFAULT_INLINE_LIMIT,
       debugLogging: saved?.debugLogging ?? false,
-      legacyMigration: saved?.legacyMigration,
     };
     await this.saveSettings();
     const statusBar = this.addStatusBarItem();
@@ -196,21 +161,6 @@ export default class EasySyncPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     await this.disconnect();
-  }
-
-  private legacyPluginIsEnabled(): boolean {
-    const enabled = (this.app as App & { plugins?: { enabledPlugins?: Set<string> } }).plugins?.enabledPlugins;
-    return enabled?.has(LEGACY_PLUGIN_ID) ?? false;
-  }
-
-  private async loadLegacyData(pluginId: string): Promise<Record<string, unknown> | null> {
-    if (pluginId !== LEGACY_PLUGIN_ID) return null;
-    const adapter = this.app.vault.adapter;
-    const path = normalizePath(`${this.app.vault.configDir}/plugins/${pluginId}/data.json`);
-    if (!(await adapter.exists(path))) return null;
-    const raw = await adapter.read(path);
-    const data: unknown = JSON.parse(raw);
-    return data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : null;
   }
 
   async saveSettings(): Promise<void> {
@@ -333,7 +283,7 @@ class ExportConfigModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: `Transfer ${PLUGIN_ID} settings` });
-    contentEl.createEl("p", { text: "Set a code phrase of at least 8 characters. The QR contains encrypted NATS and S3 credentials. Enter the phrase separately on your iPhone." });
+    contentEl.createEl("p", { text: "Leave the code phrase empty to create a plaintext v2 QR. A phrase of at least 8 characters creates an encrypted v1 QR; enter it separately on your iPhone." });
     let phrase = "";
     const result = contentEl.createDiv();
     new Setting(contentEl).setName("Code phrase")
@@ -344,11 +294,11 @@ class ExportConfigModal extends Modal {
         const payload = await this.plugin.exportConfig(phrase);
         const uri = `obsidian://${PLUGIN_ID}-import?data=${encodeURIComponent(payload)}`;
         const image = await QRCode.toDataURL(uri, { errorCorrectionLevel: "M", margin: 2, width: 400 });
-        result.createEl("img", { attr: { src: image, alt: `Encrypted ${PLUGIN_ID} settings QR` } });
-        result.createEl("p", { text: "Scan with iPhone Camera. Open the Obsidian link, then enter the code phrase." });
+        result.createEl("img", { attr: { src: image, alt: `${PLUGIN_ID} settings QR` } });
+        result.createEl("p", { text: phrase ? "Scan with iPhone Camera. Open the Obsidian link, then enter the code phrase." : "Scan with iPhone Camera and open the Obsidian link." });
         new Setting(result).addButton((copy) => copy.setButtonText("Copy transfer link").onClick(async () => {
           await navigator.clipboard.writeText(uri);
-          new Notice("Encrypted transfer link copied");
+          new Notice("Transfer link copied");
         }));
       } catch (error) {
         result.createEl("p", { text: errorSummary(error) });
@@ -367,11 +317,26 @@ class ImportConfigModal extends Modal {
     let payload = this.initialPayload;
     let phrase = "";
     const result = contentEl.createDiv();
-    new Setting(contentEl).setName("Transfer code")
-      .setDesc("Filled automatically when opened from the QR. You can also paste the encrypted code.")
-      .addTextArea((input) => input.setValue(payload).onChange((value) => { payload = value.trim(); }));
-    new Setting(contentEl).setName("Code phrase")
+    const transferSetting = new Setting(contentEl);
+    const phraseSetting = new Setting(contentEl);
+    const updatePhraseRequirement = (): void => {
+      try {
+        const version = transferVersion(payload);
+        const required = version === 1;
+        phraseSetting.settingEl.toggle(required);
+        if (!required) phrase = "";
+        result.empty();
+      } catch {
+        phraseSetting.settingEl.toggle(false);
+      }
+    };
+    transferSetting.setName("Transfer code")
+      .setDesc("Filled automatically when opened from the QR. Paste a version 1 encrypted or version 2 plaintext code.")
+      .addTextArea((input) => input.setValue(payload).onChange((value) => { payload = value.trim(); updatePhraseRequirement(); }));
+    phraseSetting.setName("Code phrase")
+      .setDesc("Required for encrypted version 1 transfer codes.")
       .addText((input) => { input.inputEl.type = "password"; input.onChange((value) => { phrase = value; }); });
+    updatePhraseRequirement();
     new Setting(contentEl).addButton((button) => button.setButtonText("Connect").onClick(async () => {
       result.empty();
       button.setDisabled(true);

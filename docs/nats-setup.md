@@ -13,7 +13,9 @@ Install `fos` from source using [the installation guide](fos-install.md), then f
 
 First point a domain, such as `sync.example.com`, at the server's public IP address. Ensure TCP ports 80 and 443 can reach the server so Caddy can complete ACME HTTP-01 validation and renew certificates. The plugin endpoint must be a valid domain-based URL such as `wss://sync.example.com`; IP-only TLS endpoints are not supported.
 
-Run `sudo fos plan` to inspect the selected native, Docker Compose, or Podman Compose layout, then run `sudo fos bootstrap` and confirm the rendered plan. `fos` generates separate administrator and first-vault NATS credentials. It displays them only through the protected post-install handoff; record both securely. The administrator credential is required for later bucket and vault-user management. Give plugin users only their vault-specific credentials.
+Run `sudo fos plan` to inspect the selected native, Docker Compose, or Podman Compose layout, then run `sudo fos bootstrap --wss-endpoint wss://sync.example.com` and confirm the rendered plan. `fos` generates separate administrator and first-vault NATS credentials. It displays them only through the protected post-install handoff; record both securely. The administrator credential is required for later bucket and vault-user management. Give plugin users only their vault-specific credentials.
+
+The explicit `--wss-endpoint` overrides the managed bootstrap endpoint. Without it, later interactive vault-user operations use the managed endpoint or prompt; unattended operations fail before changing NATS if no endpoint is available. `--keep` retains only a newly generated vault credential in the protected local store. Bootstrap separately retains the administrator credential. Use `fos import --vault-id VAULT_ID` only for a vault explicitly retained with `--keep`; it reads local state and never contacts NATS. Missing, revoked, or unretained credentials require a vault rotation.
 
 For unattended operation, use a root-owned protected input file, pass `--approve`, and choose a root-only `--secrets-output` destination. Do not pass passwords as command-line flags or save generated secrets in a repository, shell history, or ordinary logs.
 
@@ -72,7 +74,9 @@ Confirm the domain DNS record resolves to the server and that every device accep
 
 ## Plugin configuration and optional S3
 
-In **Settings → Community plugins → flash-osidian-sync**, enter the provisioned Vault ID, `wss://` endpoint, vault username, and vault password. The plugin opens only `OBS_<vaultId>_FILES`.
+In **Settings → Community plugins → flash-osidian-sync**, enter the provisioned Vault ID, `wss://` endpoint, vault username, and vault password, or open the vault-only URI from `fos`. The plugin opens only `OBS_<vaultId>_FILES` and saves imported NATS passwords and optional S3 secrets in Obsidian SecretStorage rather than ordinary plugin settings.
+
+The URI and QR contain a vault password. An empty optional phrase creates plaintext version 2; a phrase of at least eight characters creates encrypted version 1, which the plugin requests during import. Keep QR/link sharing private and the phrase separate. Administrator credentials must never be imported into Obsidian.
 
 S3 is optional. Leave all S3 fields empty to synchronize Markdown and content that fits the inline limit through NATS only. In that mode, images and other larger files are not synchronized. To synchronize large files, provide all S3 settings: HTTPS endpoint, bucket, region, access key ID, and secret key.
 
@@ -80,4 +84,4 @@ S3 is optional. Leave all S3 fields empty to synchronize Markdown and content th
 
 Test a vault user's `put`, `get`, `watch`, `create`, `update`, and `status` operations only in that vault's bucket. Verify that the same user cannot access another vault's bucket and that invalid credentials are rejected. Check the plugin status after **Connect**; `SYNCED` indicates the initial reconciliation completed.
 
-Before adding another device, back up its vault. Review conflict copies instead of deleting them blindly. For recovery, preserve the JetStream store and Caddy certificate data, stop the affected `fos-*` service or Compose project, and inspect `fos status` plus the protected state manifest. Do not remove volumes or the NATS store as part of a retry. Rotate a compromised vault password with the administrator account, update the plugin secret, and verify the old credential no longer connects.
+Before adding another device, back up its vault. Review conflict copies instead of deleting them blindly. For recovery, preserve the JetStream store and Caddy certificate data, stop the affected `fos-*` service or Compose project, and inspect `fos status` plus the protected state manifest. Do not remove volumes or the NATS store as part of a retry. Rotate a compromised vault password with the administrator account, import the new handoff on each device, and verify the old credential no longer connects. Revocation removes that vault's retained handoff record after the server change; use rotation with `--keep` when a new recoverable handoff is needed.

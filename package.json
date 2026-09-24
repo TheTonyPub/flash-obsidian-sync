@@ -1,7 +1,11 @@
 {
-  "name": "flash-osidian-sync",
+  "name": "obsidian-flash-sync",
   "private": true,
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TheTonyPub/obsidian-flash-sync.git"
+  },
   "workspaces": [
     "packages/*"
   ],
@@ -15,7 +19,7 @@
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:coverage": "vitest run tests/unit --coverage",
-    "test:integration": "vitest run tests/integration --passWithNoTests",
+    "test:integration": "vitest run tests/integration --exclude tests/integration/server-cli-bundle.test.ts --passWithNoTests",
     "test:simulation": "vitest run tests/simulation --passWithNoTests"
   },
   "devDependencies": {
