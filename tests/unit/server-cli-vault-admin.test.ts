@@ -101,4 +101,38 @@ describe("fos vault bucket commands", () => {
       createAdapter: () => remote as never, createAdminAdapter: () => remote,
     })).resolves.toEqual([bucket("notes")]);
   });
+
+  it("uses managed mode and the protected stored administrator credential for bare vault list", async () => {
+    const remote = adapter([bucket("notes")]);
+    const resolveMode = vi.fn().mockResolvedValue("podman");
+
+    await expect(runVaultCommand(["list"], {
+      host,
+      resolveMode,
+      createAdapter: () => remote as never,
+      createAdminAdapter: () => remote,
+      credentialStore: { readAdministrator: async () => ({
+        kind: "administrator", username: "fos-admin", password: "admin-secret", endpoint: "wss://sync.example.test",
+      }) },
+    })).resolves.toEqual([bucket("notes")]);
+
+    expect(resolveMode).toHaveBeenCalledOnce();
+    expect(remote.authenticate).toHaveBeenCalledWith(administrator);
+  });
+
+  it("requires explicit mode when managed mode cannot be resolved", async () => {
+    await expect(runVaultCommand(["list"], {
+      host, resolveMode: async () => undefined,
+      createAdapter: () => adapter() as never, createAdminAdapter: () => adapter(),
+    })).rejects.toThrow("INSTALL_MODE_REQUIRED");
+  });
+
+  it("rejects unknown vault options before resolving managed defaults", async () => {
+    const resolveMode = vi.fn().mockResolvedValue(undefined);
+    await expect(runVaultCommand(["list", "--unknown"], {
+      host, resolveMode,
+      createAdapter: () => adapter() as never, createAdminAdapter: () => adapter(),
+    })).rejects.toThrow("UNKNOWN_VAULT_OPTION:--unknown");
+    expect(resolveMode).not.toHaveBeenCalled();
+  });
 });

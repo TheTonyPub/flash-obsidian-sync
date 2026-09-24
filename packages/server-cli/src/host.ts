@@ -1,7 +1,8 @@
-import { chmod, chown, lstat, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, chown, lstat, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { HostPlatform } from "./cli.js";
 import type { OwnedResource, OwnedStateAdapter, OwnedStateManifest } from "./state.js";
+import { createCredentialStore, type AtomicFs, type CredentialStore } from "./credential-store.js";
 
 export async function readLocalPlatform(
   readOsRelease: (path: string, encoding: "utf8") => Promise<string> = readFile,
@@ -103,4 +104,30 @@ export function createLocalOwnedStateAdapter(options: LocalStateAdapterOptions =
       }
     },
   };
+}
+
+export function createLocalCredentialStore(rootDir = "/var/lib/flash-osidian-sync/credentials"): CredentialStore {
+  const fs: AtomicFs = {
+    readFile: (path) => readFile(path, "utf8"),
+    removeFile: (path) => unlink(path),
+    writeFileAtomically: async (path, contents, options) => {
+      try {
+        if ((await lstat(path)).isSymbolicLink()) throw new Error("CREDENTIAL_STORE_PATH_CONFLICT");
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      const temporary = join(dirname(path), `.${path.split("/").pop()}.${process.pid}.${crypto.randomUUID()}.tmp`);
+      try {
+        await writeFile(temporary, contents, { encoding: "utf8", mode: options.mode, flag: "wx" });
+        await chmod(temporary, options.mode);
+        await chown(temporary, options.owner, -1);
+        await rename(temporary, path);
+      } catch (error) {
+        await unlink(temporary).catch(() => {});
+        throw error;
+      }
+    },
+  };
+  return createCredentialStore({ rootDir, fs });
 }

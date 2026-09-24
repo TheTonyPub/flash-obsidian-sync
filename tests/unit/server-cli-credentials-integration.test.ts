@@ -80,6 +80,41 @@ describe("fos bootstrap credential integration", () => {
     expect(secretOutput.writeFileAtomically).not.toHaveBeenCalled();
   });
 
+  it("uses explicit protected output in interactive bootstrap instead of terminal disclosure", async () => {
+    const secretOutput = { writeFileAtomically: vi.fn().mockResolvedValue(undefined) };
+    const discloseInteractiveSecrets = vi.fn();
+    const prompt = vi.fn().mockResolvedValue("yes");
+    const args = ["bootstrap", "--mode", "docker", "--domain", "sync.example.test", "--vault-id", "notes", "--secrets-output", "/root/fos-secrets"];
+
+    await runBootstrap(args, {
+      host, state: stateAdapter(), apply: vi.fn().mockResolvedValue(undefined), secretOutput,
+      discloseInteractiveSecrets, prompt,
+    });
+
+    expect(secretOutput.writeFileAtomically).toHaveBeenCalledWith(
+      "/root/fos-secrets", expect.stringContaining("Administrator password:"), { owner: 0, mode: 0o600 },
+    );
+    expect(discloseInteractiveSecrets).not.toHaveBeenCalled();
+  });
+
+  it("uses explicit protected output for interactive bootstrap recovery disclosure", async () => {
+    const state = stateAdapter();
+    state.writeStateAtomically.mockRejectedValue(new Error("state unavailable"));
+    const secretOutput = { writeFileAtomically: vi.fn().mockResolvedValue(undefined) };
+    const discloseInteractiveSecrets = vi.fn();
+    const prompt = vi.fn().mockResolvedValue("yes");
+    const args = ["bootstrap", "--mode", "docker", "--domain", "sync.example.test", "--vault-id", "notes", "--secrets-output", "/root/fos-secrets"];
+
+    await expect(runBootstrap(args, {
+      host, state, apply: vi.fn().mockResolvedValue(undefined), secretOutput, discloseInteractiveSecrets, prompt,
+    })).rejects.toThrow("Managed state commit failed");
+
+    expect(secretOutput.writeFileAtomically).toHaveBeenCalledWith(
+      "/root/fos-secrets", expect.stringContaining("Administrator password:"), { owner: 0, mode: 0o600 },
+    );
+    expect(discloseInteractiveSecrets).not.toHaveBeenCalled();
+  });
+
   it("does not commit state or hand off secrets if first-vault scoped verification fails after deployment", async () => {
     const state = stateAdapter();
     const secretOutput = { writeFileAtomically: vi.fn().mockResolvedValue(undefined) };

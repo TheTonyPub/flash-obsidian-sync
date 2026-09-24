@@ -9,7 +9,7 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     env:
-      PUBLISH_COVERAGE_BADGE: ${{ secrets.GIST_TOKEN != '' }}
+      PUBLISH_COVERAGE_BADGE: ${{ secrets.GIST_ID != '' && secrets.GIST_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,19 +22,20 @@ jobs:
       - run: npm run build:plugin
       - run: npm run test:coverage
       - name: Record badge publish start
-        if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+        if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/master') }}
         run: echo "BADGE_PUBLISH_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       - name: Publish unit test coverage badge
-        if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+        if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/master') }}
         uses: gaelgirodon/ci-badges-action@v1
         with:
-          gist-id: 26e423a64b46c4ca558901a40f9c9e3d
+          gist-id: ${{ secrets.GIST_ID }}
           token: ${{ secrets.GIST_TOKEN }}
+          ref: true
       - name: Verify coverage badge was published
-        if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+        if: ${{ env.PUBLISH_COVERAGE_BADGE == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/master') }}
         env:
           GH_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID: 26e423a64b46c4ca558901a40f9c9e3d
+          GIST_ID: ${{ secrets.GIST_ID }}
         run: |
           updated_at=$(gh api "/gists/$GIST_ID" --jq .updated_at)
           if [[ "$updated_at" < "$BADGE_PUBLISH_STARTED_AT" ]]; then
@@ -47,6 +48,7 @@ jobs:
           echo "5d2c51caca950333aba84911df7d377f826f3a59ec36061c6539105084f65c92  $RUNNER_TEMP/nats-server.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/nats-server.tar.gz" -C "$RUNNER_TEMP"
           echo "NATS_SERVER_BIN=$RUNNER_TEMP/nats-server-v2.15.0-linux-amd64/nats-server" >> "$GITHUB_ENV"
+      - run: npm run test:server-cli-bundle
       - run: npm run test:integration
       - run: NATS_TEST_DOCKER=1 npx vitest run tests/integration/recovery-nats.test.ts
       - run: S3_TEST_DOCKER=1 npx vitest run tests/integration/blob-minio.test.ts

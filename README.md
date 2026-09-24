@@ -1,8 +1,10 @@
 # obsidian-flash-sync
 
-[![Unit test coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2FTheTonyPub%2F26e423a64b46c4ca558901a40f9c9e3d%2Fraw%2Fobsidian-flash-sync-lcov-coverage.json)](https://gist.github.com/TheTonyPub/26e423a64b46c4ca558901a40f9c9e3d)
-[![CI build](https://github.com/TheTonyPub/obsidian-flash-sync/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/TheTonyPub/obsidian-flash-sync/actions/workflows/ci.yml?query=branch%3Adev)
-[![Latest release](https://img.shields.io/github/v/release/TheTonyPub/obsidian-flash-sync?include_prereleases&sort=date)](https://github.com/TheTonyPub/obsidian-flash-sync/releases)
+[![Master unit test coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2FTheTonyPub%2F26e423a64b46c4ca558901a40f9c9e3d%2Fraw%2Fobsidian-flash-sync-master-lcov-coverage.json)](https://gist.github.com/TheTonyPub/26e423a64b46c4ca558901a40f9c9e3d)
+[![Master CI build](https://github.com/TheTonyPub/obsidian-flash-sync/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/TheTonyPub/obsidian-flash-sync/actions/workflows/ci.yml?query=branch%3Amaster)
+[![Latest stable release](https://img.shields.io/github/v/release/TheTonyPub/obsidian-flash-sync?include_prereleases=false)](https://github.com/TheTonyPub/obsidian-flash-sync/releases/latest)
+
+`flash-osidian-sync` is a self-hosted Obsidian plugin that synchronizes vault content through a pre-provisioned NATS JetStream KV bucket over WSS. It is not yet distributed through the Obsidian community plugin catalogue
 
 ## Contents
 
@@ -14,8 +16,6 @@
 - [Check connection](#check-connection)
 - [Server bootstrap CLI](#server-bootstrap-cli)
 - [Features](#features)
-
-`flash-sync` is a self-hosted Obsidian plugin that synchronizes vault content through a pre-provisioned NATS JetStream KV bucket over WSS. Stable releases are the only versions intended for Obsidian Community Directory submission; alpha and beta releases and development builds are for manual installation.
 
 ## Prerequisites
 
@@ -97,7 +97,7 @@ Realised:
 
 Planned:
 
-- [ ] Generate an Obsidian import link for vault credentials from the `fos` bootstrap CLI.
+- [x] Generate an Obsidian import link for vault credentials from the `fos` bootstrap CLI.
 - [ ] Add end-to-end encryption for synchronized data.
 - [ ] Back up vault content to a remote Git repository.
 - [ ] Monitor the NATS server and show usage statistics.

@@ -162,7 +162,7 @@ function podmanAdapter(runtime: BootstrapRuntime, plan: BootstrapPlan): PodmanDe
   };
 }
 
-function hostOptionsAdapter(runtime: BootstrapRuntime): HostOptionsAdapter {
+export function createHostOptionsAdapter(runtime: BootstrapRuntime): HostOptionsAdapter {
   const added: number[] = [];
   return {
     async activeSshPort() {
@@ -175,7 +175,12 @@ function hostOptionsAdapter(runtime: BootstrapRuntime): HostOptionsAdapter {
     async applyFirewall(ports) {
       for (const port of ports) { await runtime.run(["ufw", "allow", `${port}/tcp`]); added.push(port); }
     },
-    async verifySsh(port) { return (await runtime.run(["ufw", "status"])).includes(`${port}/tcp`); },
+    async verifySsh(port) {
+      const status = await runtime.run(["ufw", "status"]);
+      if (/^Status:\s*inactive\s*$/mi.test(status)) return true;
+      if (!/^Status:\s*active\s*$/mi.test(status)) return false;
+      return new RegExp(`^\\s*${port}/tcp(?:\\s+\\(v6\\))?\\s+ALLOW(?:\\s|$)`, "m").test(status);
+    },
     async rollbackFirewall() { for (const port of added.reverse()) await runtime.run(["ufw", "delete", "allow", `${port}/tcp`]); },
     identityExists: (user, group) => Promise.all([commandAvailable(runtime, ["getent", "passwd", user]), commandAvailable(runtime, ["getent", "group", group])]).then((result) => result.every(Boolean)),
     async createDedicatedIdentity(user, group) {
@@ -189,7 +194,7 @@ function hostOptionsAdapter(runtime: BootstrapRuntime): HostOptionsAdapter {
 export function createBootstrapApply(runtime: BootstrapRuntime, endpointReadiness?: EndpointReadinessOptions): (plan: BootstrapPlan, credentials?: BootstrapCredentials) => Promise<void> {
   return async (plan, credentials) => {
     if (runtime.uid() !== 0) throw new Error("ROOT_REQUIRED");
-    const options = hostOptionsAdapter(runtime);
+    const options = createHostOptionsAdapter(runtime);
     const selected = plan.hostOptions ?? planHostOptions({ firewall: { enabled: false }, identity: { kind: "existing", user: "fos-nats", group: "fos-nats" } });
     if (plan.mode === "native") await applyServiceIdentity(selected.identity, options);
     await applyFirewallOption(selected.firewall, options);
@@ -244,14 +249,16 @@ function parseManagedAuthorization(config: string): ManagedAuthorization {
 
 function replaceManagedAuthorization(config: string, authorization: string): string {
   if (!authorizationBlock.test(config)) throw new Error("MANAGED_AUTHORIZATION_NOT_FOUND");
-  return config.replace(authorizationBlock, authorization);
+  return config.replace(authorizationBlock, () => authorization);
 }
 
 /** Runtime-backed vault-user config editor. It only replaces the marked authorization block. */
 export function createVaultUserAdapter(runtime: BootstrapRuntime, plan: BootstrapPlan): VaultUserAdapter {
   const configPath = `${plan.installPath}/nats-server.conf`;
+  // Atomic replacement changes the inode behind a single-file bind mount.
+  // Recreate only NATS so container backends read the new file, including rollback.
   const reload = plan.mode === "native" ? ["systemctl", "reload", "fos-nats.service"] as const
-    : composeCommand(plan.mode === "docker" ? "docker" : "podman", ["-p", plan.composeProject!, "-f", `${plan.installPath}/compose.yaml`, "kill", "-s", "SIGHUP", "nats"]);
+    : composeCommand(plan.mode === "docker" ? "docker" : "podman", ["-p", plan.composeProject!, "-f", `${plan.installPath}/compose.yaml`, "up", "-d", "--no-deps", "--force-recreate", "nats"]);
   const read = (): Promise<string> => runtime.readText(configPath);
   const write = async (authorization: string): Promise<void> => {
     const next = replaceManagedAuthorization(await read(), authorization);
@@ -265,11 +272,13 @@ export function createVaultUserAdapter(runtime: BootstrapRuntime, plan: Bootstra
     },
     readAuthorization: async () => parseManagedAuthorization(await read()),
     validate: async (authorization) => {
-      const temporary = `${dirname(configPath)}/.nats-server.conf.${runtime.randomId()}.validate`;
+      const validationId = runtime.randomId();
+      const temporary = `${dirname(configPath)}/.nats-server.conf.${validationId}.validate`;
+      const containerConfig = `/tmp/.nats-server.conf.${validationId}.validate`;
       try {
         await runtime.writeText(temporary, replaceManagedAuthorization(await read(), authorization), 0o640);
         if (plan.mode === "native") await runtime.run(["nats-server", "-c", temporary, "-t"]);
-        else await runtime.run(composeCommand(plan.mode === "docker" ? "docker" : "podman", ["-p", plan.composeProject!, "-f", `${plan.installPath}/compose.yaml`, "run", "--rm", "--no-deps", "-v", `${temporary}:/etc/nats/nats-server.conf:ro`, "nats", "nats-server", "-c", "/etc/nats/nats-server.conf", "-t"]));
+        else await runtime.run(composeCommand(plan.mode === "docker" ? "docker" : "podman", ["-p", plan.composeProject!, "-f", `${plan.installPath}/compose.yaml`, "run", "--rm", "--no-deps", "-v", `${temporary}:${containerConfig}:ro`, "nats", "-c", containerConfig, "-t"]));
       } finally { await runtime.remove(temporary).catch(() => {}); }
     },
     write,

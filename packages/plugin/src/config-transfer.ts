@@ -14,6 +14,7 @@ export interface TransferConfig {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const iterations = 250_000;
+const maxTransferLength = 4096;
 
 function base64url(bytes: Uint8Array): string {
   let binary = "";
@@ -23,8 +24,17 @@ function base64url(bytes: Uint8Array): string {
 
 function unbase64url(value: string): Uint8Array {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("Invalid transfer code");
-  const binary = atob(value.replaceAll("-", "+").replaceAll("_", "/"));
+  const padding = "=".repeat((4 - value.length % 4) % 4);
+  const binary = atob(value.replaceAll("-", "+").replaceAll("_", "/") + padding);
   return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+export function transferVersion(payload: string): 1 | 2 {
+  const separator = payload.indexOf(".");
+  const version = separator === -1 ? "" : payload.slice(0, separator);
+  if (version === "1") return 1;
+  if (version === "2") return 2;
+  throw new Error("Unsupported transfer code version");
 }
 
 function validate(value: unknown): TransferConfig {
@@ -47,16 +57,20 @@ async function key(phrase: string, salt: Uint8Array): Promise<CryptoKey> {
 }
 
 export async function encryptTransfer(config: TransferConfig, phrase: string): Promise<string> {
-  if (phrase.length < 8) throw new Error("Code phrase must contain at least 8 characters");
   const plain = encoder.encode(JSON.stringify(validate(config)));
+  if (phrase === "") return requireTransferLength(`2.${base64url(plain)}`);
+  if (phrase.length < 8) throw new Error("Code phrase must contain at least 8 characters");
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await key(phrase, salt), plain));
-  return `1.${base64url(new Uint8Array([...salt, ...iv, ...cipher]))}`;
+  return requireTransferLength(`1.${base64url(new Uint8Array([...salt, ...iv, ...cipher]))}`);
 }
 
 export async function decryptTransfer(payload: string, phrase: string): Promise<TransferConfig> {
-  if (!payload.startsWith("1.") || payload.length > 4096) throw new Error("Unsupported transfer code");
+  if (payload.length > maxTransferLength) throw new Error("Invalid transfer code");
+  const version = transferVersion(payload);
+  if (version === 2) return validate(JSON.parse(decoder.decode(unbase64url(payload.slice(2)))));
+  if (phrase.length < 8) throw new Error("Code phrase must contain at least 8 characters");
   const packed = unbase64url(payload.slice(2));
   if (packed.length < 45) throw new Error("Invalid transfer code");
   const salt = packed.slice(0, 16);
@@ -64,4 +78,9 @@ export async function decryptTransfer(payload: string, phrase: string): Promise<
   const cipher = packed.slice(28);
   const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, await key(phrase, salt), cipher);
   return validate(JSON.parse(decoder.decode(plain)));
+}
+
+function requireTransferLength(payload: string): string {
+  if (payload.length > maxTransferLength) throw new Error("Transfer code exceeds the 4096-character limit");
+  return payload;
 }
