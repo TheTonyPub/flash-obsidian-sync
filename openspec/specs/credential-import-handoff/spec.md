@@ -2,7 +2,7 @@
 
 Defines a versioned, secure handoff from the provisioning CLI to the Obsidian plugin and a local-only way to reproduce a vault handoff when its credential was explicitly retained.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Versioned import payloads
 The system SHALL encode a complete vault connection configuration in a versioned payload used by an Obsidian import URI and terminal QR code. The configuration SHALL include `vaultId`, a `wss://` endpoint, vault username and password, all optional S3 fields as strings, and a positive inline limit. A generated handoff without S3 settings SHALL encode empty S3 fields and the plugin default inline limit. The producer and plugin SHALL reject malformed, oversized, invalid-vault-ID, non-WSS, invalid-S3-HTTPS, or nonpositive-inline-limit payloads before saving settings or attempting a connection.
