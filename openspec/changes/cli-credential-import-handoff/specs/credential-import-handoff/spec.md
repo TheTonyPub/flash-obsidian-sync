@@ -71,3 +71,13 @@ The CLI SHALL maintain its fixed managed credential store in a root-owned locati
 - **WHEN** bootstrap or vault-user creation completes without `--keep`
 - **THEN** the CLI displays the import URI and QR code once but retains no plaintext vault credential for later import
 
+### Requirement: Terminal handoff presentation
+The CLI SHALL display the complete Obsidian import URI on a visually distinct, copyable line. On colored terminal output it SHALL use compact QR rendering at approximately half the width and height of the standard terminal rendering for the same URI, while preserving error-correction level M. Protected handoff files SHALL contain plain UTF-8 output without ANSI control sequences.
+
+#### Scenario: Colored terminal handoff
+- **WHEN** the CLI displays an Obsidian handoff in a colored terminal
+- **THEN** the complete URI is visually highlighted and copyable, and its QR uses compact rendering
+
+#### Scenario: Protected handoff file
+- **WHEN** the CLI writes a handoff to a protected output file
+- **THEN** the URI and QR are emitted without terminal color escape sequences

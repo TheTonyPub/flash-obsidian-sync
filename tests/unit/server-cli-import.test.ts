@@ -133,6 +133,22 @@ describe("fos import command", () => {
     );
   });
 
+  it("writes to an explicit protected output path in interactive mode without disclosing to the terminal", async () => {
+    const credentialStore = retainedStore();
+    const writeFileAtomically = vi.fn().mockResolvedValue(undefined);
+    const discloseInteractiveSecrets = vi.fn();
+    const renderHandoff = vi.fn().mockResolvedValue(handoffResult());
+
+    await runImport(["import", "--vault-id", "notes", "--secrets-output", "/root/fos-import-output"], {
+      credentialStore, renderHandoff, unattended: false, secretOutput: { writeFileAtomically }, discloseInteractiveSecrets,
+    });
+
+    expect(writeFileAtomically).toHaveBeenCalledWith(
+      "/root/fos-import-output", expect.stringContaining("obsidian://flash-sync-import?data=2.payload"), { owner: 0, mode: 0o600 },
+    );
+    expect(discloseInteractiveSecrets).not.toHaveBeenCalled();
+  });
+
   it("discloses URI and QR interactively without administrator credentials", async () => {
     const credentialStore = retainedStore();
     const discloseInteractiveSecrets = vi.fn();

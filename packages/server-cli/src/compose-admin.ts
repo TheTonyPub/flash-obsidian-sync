@@ -20,7 +20,7 @@ export async function runComposeAdminWorker(runtime: ComposeAdminRuntime, projec
   request: ComposeWorkerRequest): Promise<string> {
   const image = imageReference(imageLock.nodeAdmin);
   return runtime.runContainer([
-    "run", "--rm", "-i", "--network", `${project}_fos-internal`, "--pull", "never",
+    "run", "--rm", "-i", "--network", `${project}_fos-internal`, "--pull", "missing",
     "--mount", `type=bind,src=${workerPath},dst=/app/admin-worker.js,readonly`, image, "node", "/app/admin-worker.js",
   ], `${JSON.stringify(request)}\n`);
 }

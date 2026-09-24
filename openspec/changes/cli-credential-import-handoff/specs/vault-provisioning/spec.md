@@ -53,3 +53,9 @@ The CLI SHALL provide list, credential rotation, and revocation operations for v
 - **WHEN** an operator confirms revocation
 - **THEN** new connections with that user's old credentials are rejected, its retained credential is removed, and other vault users remain usable
 
+### Requirement: List vaults without an identifier
+The CLI SHALL list provisioned vaults without requiring a vault ID and SHALL resolve the managed installation mode when one is available.
+
+#### Scenario: Bare vault list
+- **WHEN** an operator runs `fos vault list` on a configured installation without `--vault-id`
+- **THEN** the CLI uses the managed installation mode, authenticates the administrator, and lists provisioned vaults

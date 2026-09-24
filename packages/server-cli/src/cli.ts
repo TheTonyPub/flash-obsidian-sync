@@ -82,6 +82,7 @@ type VaultAction = "add" | "rotate" | "revoke" | "create" | "list" | "inspect" |
 
 export interface RunVaultCommandOptions {
   host: HostAdapter;
+  resolveMode?: () => Promise<InstallMode | undefined>;
   createAdapter(plan: BootstrapPlan): VaultUserAdapter;
   createAdminAdapter?(plan: BootstrapPlan, administrator: { username: string; password: string }): VaultAdminAdapter;
   createVerificationAdapter?(plan: BootstrapPlan, credentials: { username: string; password: string }, crossVaultId?: string): VaultVerificationAdapter;
@@ -367,8 +368,8 @@ export async function runBootstrap(args: string[], options: RunBootstrapOptions)
   if (!request.approve) return { preview: plan.preview, applied: false };
   if (!options.apply) throw failure("APPLY_ADAPTER_REQUIRED");
   if (!options.state) throw failure("STATE_ADAPTER_REQUIRED");
-  if (request.nonInteractive && !options.secretOutput) throw failure("SECRETS_OUTPUT_ADAPTER_REQUIRED");
-  if (!request.nonInteractive && !options.discloseInteractiveSecrets) throw failure("INTERACTIVE_SECRETS_OUTPUT_REQUIRED");
+  if ((request.nonInteractive || request.secretsOutput) && !options.secretOutput) throw failure("SECRETS_OUTPUT_ADAPTER_REQUIRED");
+  if (!request.nonInteractive && !request.secretsOutput && !options.discloseInteractiveSecrets) throw failure("INTERACTIVE_SECRETS_OUTPUT_REQUIRED");
   const endpoint = request.wssEndpoint ?? validateEndpoint(`wss://${plan.domain}`);
   const encryptionPhrase = await handoffPhrase(options.promptEncryptionPhrase, request.nonInteractive);
   const prepared = await prepareOwnedState(plan, options.state);
@@ -378,7 +379,7 @@ export async function runBootstrap(args: string[], options: RunBootstrapOptions)
   const handoff = createCredentialHandoff(credentials);
   const disclose = async (rendered?: HandoffResult): Promise<void> => {
     const append = (contents: string) => `${contents}${rendered?.uri ? `Obsidian import URI: ${rendered.uri}\n${rendered.qr}\n` : ""}`;
-    if (request.nonInteractive) await handoff.writeUnattended(request.secretsOutput!, {
+    if (request.secretsOutput) await handoff.writeUnattended(request.secretsOutput, {
       writeFileAtomically: (path, contents, options_) => options.secretOutput!.writeFileAtomically(path, append(contents), options_),
     });
     else await handoff.discloseInteractive((contents) => options.discloseInteractiveSecrets!(append(contents)));
@@ -426,6 +427,26 @@ function vaultAction(args: string[]): VaultAction {
   throw failure("VAULT_ACTION_REQUIRED");
 }
 
+function validateVaultOptions(args: string[], action: VaultAction): void {
+  const allowed: Record<VaultAction, readonly string[]> = {
+    list: ["--mode", "--admin-input"],
+    create: ["--mode", "--vault-id", "--admin-input"],
+    inspect: ["--mode", "--vault-id", "--admin-input"],
+    add: ["--mode", "--vault-id", "--admin-input", "--secrets-output", "--wss-endpoint", "--keep"],
+    rotate: ["--mode", "--vault-id", "--admin-input", "--secrets-output", "--wss-endpoint", "--keep"],
+    revoke: ["--mode", "--vault-id", "--admin-input"],
+    verify: ["--mode", "--vault-id", "--admin-input", "--vault-input", "--cross-vault-id"],
+  };
+  const flags = new Set(["--keep"]);
+  for (let index = 1; index < args.length; index += 1) {
+    const option = args[index]!;
+    if (!allowed[action].includes(option)) throw failure(`UNKNOWN_VAULT_OPTION:${option}`);
+    if (flags.has(option)) continue;
+    if (!args[index + 1] || args[index + 1]!.startsWith("--")) throw failure(`OPTION_VALUE_REQUIRED:${option}`);
+    index += 1;
+  }
+}
+
 function vaultPlan(mode: InstallMode, vaultId: string): BootstrapPlan {
   return {
     mode, domain: "localhost", vaultId,
@@ -450,6 +471,13 @@ async function protectedSecret(options: RunVaultCommandOptions, path: string | u
   const value = await options.promptSecret(prompt);
   if (!value) throw failure(`${code}_INPUT_REQUIRED`);
   return value;
+}
+
+async function administratorPassword(options: RunVaultCommandOptions, path: string | undefined): Promise<string> {
+  if (path) return protectedSecret(options, path, "Administrator password: ", "ADMIN");
+  const stored = await options.credentialStore?.readAdministrator?.();
+  if (stored?.kind === "administrator" && stored.username === "fos-admin" && stored.password) return stored.password;
+  return protectedSecret(options, undefined, "Administrator password: ", "ADMIN");
 }
 
 function vaultSecretHandoff(username: string, password: string): string {
@@ -482,7 +510,8 @@ export async function runImportCommand(args: string[], options: RunImportCommand
   }
   if (!vaultId || !vaultPattern.test(vaultId)) throw failure("VAULT_ID_REQUIRED");
   if (options.unattended && (!output || !options.secretOutput)) throw failure("IMPORT_SECRETS_OUTPUT_REQUIRED");
-  if (!options.unattended && !options.discloseInteractiveSecrets) throw failure("INTERACTIVE_SECRETS_OUTPUT_REQUIRED");
+  if (output && !options.secretOutput) throw failure("SECRETS_OUTPUT_ADAPTER_REQUIRED");
+  if (!output && !options.unattended && !options.discloseInteractiveSecrets) throw failure("INTERACTIVE_SECRETS_OUTPUT_REQUIRED");
   if (!options.credentialStore.readVault) throw failure("VAULT_CREDENTIAL_UNAVAILABLE: rotate the vault credential and use --keep to enable import handoffs");
   const record = importedVault(await options.credentialStore.readVault(vaultId), vaultId);
   const resolvedEndpoint = endpoint
@@ -496,14 +525,16 @@ export async function runImportCommand(args: string[], options: RunImportCommand
     s3Endpoint: "", s3Bucket: "", s3Region: "us-east-1", s3AccessKeyId: "", s3SecretKey: "", inlineLimit: 262144, encryptionPhrase,
   });
   const contents = importHandoffContents(handoff);
-  if (options.unattended) await options.secretOutput!.writeFileAtomically(output!, contents, writeOptions);
+  if (output) await options.secretOutput!.writeFileAtomically(output, contents, writeOptions);
   else await options.discloseInteractiveSecrets!(contents);
 }
 
 /** Executes operator vault-user actions without ever accepting the administrator secret as an argument. */
 export async function runVaultCommand(args: string[], options: RunVaultCommandOptions): Promise<VaultCommandResult> {
   const action = vaultAction(args);
-  const mode = vaultOption(args, "--mode") as InstallMode | undefined;
+  validateVaultOptions(args, action);
+  const requestedMode = vaultOption(args, "--mode") as InstallMode | undefined;
+  const mode = requestedMode ?? await options.resolveMode?.();
   const vaultId = vaultOption(args, "--vault-id");
   const input = vaultOption(args, "--admin-input");
   const vaultInput = vaultOption(args, "--vault-input");
@@ -511,8 +542,9 @@ export async function runVaultCommand(args: string[], options: RunVaultCommandOp
   const output = vaultOption(args, "--secrets-output");
   const endpointOption = vaultOption(args, "--wss-endpoint");
   const keep = args.includes("--keep");
-  if (!mode || (action !== "list" && !vaultId)) throw failure("VAULT_ID_REQUIRED");
+  if (!mode) throw failure("INSTALL_MODE_REQUIRED");
   if (mode !== "native" && mode !== "docker" && mode !== "podman") throw failure("INVALID_MODE");
+  if (action !== "list" && !vaultId) throw failure("VAULT_ID_REQUIRED");
   const plan = vaultPlan(mode, vaultId ?? "list");
   const handoffEndpoint = action === "add" || action === "rotate" ? await resolveVaultEndpoint(endpointOption, options) : undefined;
   if ((action === "add" || action === "rotate") && !options.createVerificationAdapter) throw failure("VAULT_VERIFICATION_ADAPTER_REQUIRED");
@@ -521,7 +553,7 @@ export async function runVaultCommand(args: string[], options: RunVaultCommandOp
   if (action === "verify") {
     if (crossVaultId !== undefined) {
       if (!options.createAdminAdapter) throw failure("VAULT_ADMIN_ADAPTER_REQUIRED");
-      const adminPassword = await protectedSecret(options, input, "Administrator password: ", "ADMIN");
+      const adminPassword = await administratorPassword(options, input);
       const administrator = { username: "fos-admin", password: adminPassword };
       if (crossVaultId === vaultId) throw failure("CROSS_VAULT_ID_INVALID");
       const peer = await inspectVault(options.createAdminAdapter(plan, administrator), administrator, crossVaultId);
@@ -533,7 +565,7 @@ export async function runVaultCommand(args: string[], options: RunVaultCommandOp
       { username: `fos-vault-${vaultId}`, password }, crossVaultId);
     return { verified: true, ...verification };
   }
-  const password = await protectedSecret(options, input, "Administrator password: ", "ADMIN");
+  const password = await administratorPassword(options, input);
   const administrator = { username: "fos-admin", password };
   if (action === "create" || action === "list" || action === "inspect") {
     if (!options.createAdminAdapter) throw failure("VAULT_ADMIN_ADAPTER_REQUIRED");
@@ -546,7 +578,8 @@ export async function runVaultCommand(args: string[], options: RunVaultCommandOp
   const target = vaultId!;
   if (action === "revoke") { await revokeVaultUser(adapter, administrator, target); await removeVault(options.credentialStore, target); return undefined; }
   if (input && !output) throw failure("VAULT_SECRETS_OUTPUT_REQUIRED");
-  if (!input && !options.discloseInteractiveSecrets) throw failure("INTERACTIVE_SECRETS_OUTPUT_REQUIRED");
+  if (output && !options.secretOutput) throw failure("SECRETS_OUTPUT_ADAPTER_REQUIRED");
+  if (!output && !options.discloseInteractiveSecrets) throw failure("INTERACTIVE_SECRETS_OUTPUT_REQUIRED");
   const retained = action === "rotate" && options.credentialStore?.readVault
     ? await options.credentialStore.readVault(target) : undefined;
   const result = action === "add"
@@ -563,7 +596,7 @@ export async function runVaultCommand(args: string[], options: RunVaultCommandOp
   if (keep) await writeVault(options.credentialStore, handoffEndpoint!, target, result.credential);
   else if (action === "rotate" && retained) await removeVault(options.credentialStore, target);
   const handoff = vaultHandoffContents(result.credential.username, result.credential.password, rendered);
-  if (input) await options.secretOutput!.writeFileAtomically(output!, handoff, writeOptions);
+  if (output) await options.secretOutput!.writeFileAtomically(output, handoff, writeOptions);
   else await options.discloseInteractiveSecrets!(handoff);
 }
 

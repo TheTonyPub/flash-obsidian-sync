@@ -106,8 +106,9 @@ describe("fos vault user lifecycle", () => {
   it("accepts only root-protected administrator input and writes new credentials to protected output", async () => {
     const host = adapter();
     const output = { writeFileAtomically: vi.fn().mockResolvedValue(undefined) };
+    const authenticate = vi.fn().mockResolvedValue(true);
     const verification: VaultVerificationAdapter = {
-      authenticate: vi.fn().mockResolvedValue(true),
+      authenticate,
       status: vi.fn().mockResolvedValue(undefined),
       put: vi.fn().mockResolvedValue(undefined),
       get: vi.fn().mockResolvedValue(new TextEncoder().encode("fos-verify")),
@@ -121,6 +122,30 @@ describe("fos vault user lifecycle", () => {
 
     await runVaultCommand(["add", "--mode", "native", "--vault-id", "notes", "--admin-input", "/root/admin", "--secrets-output", "/root/new", "--wss-endpoint", "wss://managed.example.test"], {
       host: inputHost, createAdapter: () => host, createVerificationAdapter: () => verification, secretOutput: output,
+    });
+
+    expect(output.writeFileAtomically).toHaveBeenCalledWith("/root/new", expect.stringContaining("Vault password:"), { owner: 0, mode: 0o600 });
+    expect(host.reload).toHaveBeenCalledOnce();
+    expect(authenticate).toHaveBeenCalledOnce();
+  });
+
+  it("writes unattended handoff output when using the persisted administrator credential", async () => {
+    const host = adapter();
+    const output = { writeFileAtomically: vi.fn().mockResolvedValue(undefined) };
+    const verification: VaultVerificationAdapter = {
+      authenticate: vi.fn().mockResolvedValue(true), status: vi.fn().mockResolvedValue(undefined),
+      put: vi.fn().mockResolvedValue(undefined), get: vi.fn().mockResolvedValue(new TextEncoder().encode("fos-verify")),
+      watch: vi.fn().mockResolvedValue(vi.fn()), crossBucketDenied: vi.fn().mockResolvedValue(true),
+    };
+
+    await runVaultCommand(["add", "--mode", "native", "--vault-id", "notes", "--secrets-output", "/root/new", "--wss-endpoint", "wss://managed.example.test"], {
+      host: { platform: () => ({ distribution: "debian", release: "13", architecture: "amd64" }) },
+      createAdapter: () => host, createVerificationAdapter: () => verification,
+      secretOutput: output, unattended: true,
+      credentialStore: { readAdministrator: async () => ({
+        kind: "administrator", username: "fos-admin", password: "admin-secret", endpoint: "wss://managed.example.test",
+      }) },
+      renderHandoff: async () => ({ uri: "obsidian://handoff", qr: "qr" }),
     });
 
     expect(output.writeFileAtomically).toHaveBeenCalledWith("/root/new", expect.stringContaining("Vault password:"), { owner: 0, mode: 0o600 });
