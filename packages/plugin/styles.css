@@ -1,0 +1,187 @@
+.flash-sync-settings {
+  container-type: inline-size;
+}
+
+.flash-sync-heading {
+  margin-bottom: var(--size-2-1);
+}
+
+.flash-sync-vault-id {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  margin-top: 0;
+}
+
+.flash-sync-overview-status {
+  margin-block: var(--size-4-3);
+}
+
+.flash-sync-status-row {
+  display: grid;
+  grid-template-columns: minmax(12rem, 40%) minmax(0, 1fr);
+  gap: var(--size-4-2);
+  padding-block: var(--size-2-1);
+}
+
+.flash-sync-status-row span:first-child {
+  color: var(--text-muted);
+}
+
+.flash-sync-status-row span:last-child {
+  overflow-wrap: anywhere;
+}
+
+.flash-sync-section-status {
+  color: var(--text-muted);
+  margin-block: var(--size-4-2);
+  overflow-wrap: anywhere;
+}
+
+.flash-sync-settings .setting-item-control {
+  flex: 0 1 45%;
+  min-width: min(260px, 45%);
+}
+
+.flash-sync-settings .setting-item-control input:not([type="checkbox"]):not([type="radio"]) {
+  width: 100%;
+  min-width: 0;
+}
+
+.flash-sync-error {
+  margin-top: var(--size-4-2);
+  color: var(--text-muted);
+}
+
+.flash-sync-error p {
+  overflow-wrap: anywhere;
+}
+
+.flash-sync-nav {
+  margin-block: var(--size-4-3);
+}
+
+.flash-sync-nav-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-1);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.flash-sync-nav-buttons button[role="tab"] {
+  min-height: 36px;
+  padding: var(--size-2-2) var(--size-4-2);
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+
+.flash-sync-nav-buttons button[aria-selected="true"] {
+  color: var(--text-normal);
+  border-bottom-color: var(--interactive-accent);
+}
+
+.flash-sync-nav-buttons button:focus-visible,
+.flash-sync-nav-select:focus-visible,
+.flash-sync-settings button:focus-visible,
+.flash-sync-settings input:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.flash-sync-nav-select {
+  display: none;
+  width: 100%;
+  min-height: 40px;
+  color: var(--text-normal);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+}
+
+.flash-sync-nav-select-label {
+  display: none;
+  color: var(--text-muted);
+  margin-bottom: var(--size-4-1);
+}
+
+.flash-sync-panel {
+  min-width: 0;
+}
+
+.flash-sync-actions,
+.flash-sync-transfer-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+  margin-block: var(--size-4-3);
+}
+
+.flash-sync-actions button,
+.flash-sync-transfer-modes button {
+  min-height: 40px;
+}
+
+.flash-sync-draft-note,
+.flash-sync-warning,
+.flash-sync-unprotected,
+.flash-sync-checkbox {
+  display: block;
+  margin-block: var(--size-4-2);
+}
+
+.flash-sync-warning {
+  color: var(--text-error);
+  font-weight: var(--font-semibold);
+}
+
+.flash-sync-conflicts {
+  margin-top: var(--size-4-4);
+}
+
+.flash-sync-conflicts details,
+.flash-sync-transfer-preview {
+  margin-block: var(--size-4-2);
+  overflow-wrap: anywhere;
+}
+
+@container (max-width: 600px) {
+  .flash-sync-nav-buttons {
+    display: none;
+  }
+
+  .flash-sync-nav-select {
+    display: block;
+  }
+
+  .flash-sync-nav-select-label {
+    display: block;
+  }
+
+  .flash-sync-settings .setting-item {
+    align-items: stretch;
+    flex-direction: column;
+    gap: var(--size-4-1);
+  }
+
+  .flash-sync-settings .setting-item-control {
+    width: 100%;
+    min-width: 0;
+    justify-content: flex-start;
+  }
+
+  .flash-sync-status-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .flash-sync-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .flash-sync-actions button {
+    width: 100%;
+  }
+}

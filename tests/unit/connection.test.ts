@@ -42,6 +42,8 @@ describe("NATS connection", () => {
     await expect(connectVault({ ...config("A"), server: "ws://localhost" }, secrets, connector, status)).rejects.toThrow(/WSS/);
     await expect(connectVault(config("A"), secrets, connector, status)).rejects.toThrow(/password/);
     expect(status.value).toBe("AUTH_ERROR");
+    expect(status.connectionState).toBe("AUTH_ERROR");
+    expect(status.connectionError).toMatch(/password missing/);
   });
 
   it("retains pending work after rejected or revoked credentials", async () => {

@@ -30,6 +30,13 @@ describe("plugin diagnostics", () => {
     expect(sink.debug).toHaveBeenCalledWith("[flash-sync] nats.connected", { bucket: "OBS_A_FILES" });
   });
 
+  it("redacts active secret values from technical logs", () => {
+    const sink = { debug: vi.fn(), error: vi.fn() };
+    const logger = createLogger(() => false, sink, (message) => message.replaceAll("private-token", "[redacted]"));
+    logger.error("connection.failed", new Error("Rejected private-token by server"));
+    expect(sink.error).toHaveBeenCalledWith("[flash-sync] connection.failed: Rejected [redacted] by server", {});
+  });
+
   it("keeps the root reconciliation failure visible in status and console", async () => {
     const sink = { debug: vi.fn(), error: vi.fn() };
     const logger = createLogger(() => true, sink);
