@@ -32,9 +32,15 @@ export interface KvPort {
 }
 
 export type StatusValue = "INITIALIZING" | "OFFLINE" | "AUTH_ERROR" | "RECONCILING" | "PENDING" | "LIVE" | "CONFLICT" | "ERROR" | "SYNCED";
+export type ConnectionState = "UNCONFIGURED" | "CONNECTING" | "CONNECTED" | "OFFLINE" | "AUTH_ERROR";
+export type AttachmentState = "NOT_CONFIGURED" | "CONFIGURED" | "CONFIGURATION_ERROR" | "TRANSFER_ERROR";
 
 export class SyncStatus {
   value: StatusValue = "INITIALIZING";
+  connectionState: ConnectionState = "UNCONFIGURED";
+  connectionError = "";
+  attachmentState: AttachmentState = "NOT_CONFIGURED";
+  attachmentError = "";
   connected = false;
   reconciled = false;
   pending = 0;
@@ -90,16 +96,23 @@ export async function connectVault(
   const pass = await secrets.getSecret(config.passwordSecretKey);
   if (!pass) {
     status.value = "AUTH_ERROR";
+    status.connectionState = "AUTH_ERROR";
+    status.connectionError = "NATS password missing";
     throw new Error("NATS password missing");
   }
   try {
     const kv = await connector({ servers: config.server, user: config.username, pass }, config.bucket, status);
     status.connected = true;
+    status.connectionState = "CONNECTED";
+    status.connectionError = "";
     status.value = "RECONCILING";
     return kv;
   } catch (error) {
     status.connected = false;
-    status.value = /auth|permission|authorization/i.test(String(error)) ? "AUTH_ERROR" : "OFFLINE";
+    const authError = /auth|permission|authorization/i.test(String(error));
+    status.connectionState = authError ? "AUTH_ERROR" : "OFFLINE";
+    status.connectionError = errorSummary(error);
+    status.value = authError ? "AUTH_ERROR" : "OFFLINE";
     throw error;
   }
 }
@@ -174,13 +187,15 @@ export const connectExistingNatsBucket = async (
     if (status) {
       void (async () => {
         for await (const event of connection.status()) {
-          if (event.type === "disconnect") { logger?.debug("nats.disconnected", { bucket }); status.connected = false; status.refresh(); }
-          if (event.type === "reconnect") { logger?.debug("nats.reconnected", { bucket }); status.connected = true; status.reconciled = false; status.refresh(); status.onReconnect?.(); }
+          if (event.type === "disconnect") { logger?.debug("nats.disconnected", { bucket }); status.connected = false; status.connectionState = "OFFLINE"; status.refresh(); }
+          if (event.type === "reconnect") { logger?.debug("nats.reconnected", { bucket }); status.connected = true; status.connectionState = "CONNECTED"; status.connectionError = ""; status.reconciled = false; status.refresh(); status.onReconnect?.(); }
           if (event.type === "error") {
             logger?.error("nats.error", event.error, { bucket });
             status.lastError = errorSummary(event.error);
             if (/auth|permission|authorization/i.test(String(event.error))) {
               status.connected = false;
+              status.connectionState = "AUTH_ERROR";
+              status.connectionError = errorSummary(event.error);
               status.value = "AUTH_ERROR";
             }
             status.refresh();
@@ -192,7 +207,10 @@ export const connectExistingNatsBucket = async (
         else logger?.debug("nats.closed", { bucket });
         if (error) status.lastError = errorSummary(error);
         status.connected = false;
+        status.connectionState = error && /auth|permission|authorization/i.test(String(error)) ? "AUTH_ERROR" : "OFFLINE";
+        if (error) status.connectionError = errorSummary(error);
         status.value = error && /auth|permission|authorization/i.test(String(error)) ? "AUTH_ERROR" : "OFFLINE";
+        status.refresh();
       });
     }
     return new NatsKvAdapter(kv, connection, maxValueSize, logger, bucket);

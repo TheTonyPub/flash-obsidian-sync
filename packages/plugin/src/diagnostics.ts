@@ -30,13 +30,14 @@ export function errorSummary(error: unknown): string {
   return messages.filter(Boolean).join(" → ") || "Unknown error";
 }
 
-export function createLogger(debugEnabled: () => boolean, sink: Pick<Console, "debug" | "error"> = console): PluginLogger {
+export function createLogger(debugEnabled: () => boolean, sink: Pick<Console, "debug" | "error"> = console,
+  redact: (message: string) => string = (message) => message): PluginLogger {
   return {
     debug(event, fields) {
       if (debugEnabled()) sink.debug(`[flash-sync] ${event}`, fields ?? {});
     },
     error(event, cause, fields) {
-      sink.error(`[flash-sync] ${event}: ${errorSummary(cause)}`, fields ?? {});
+      sink.error(`[flash-sync] ${event}: ${redact(errorSummary(cause))}`, fields ?? {});
     },
   };
 }

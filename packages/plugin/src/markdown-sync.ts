@@ -423,7 +423,15 @@ export class MarkdownSyncEngine {
         const key = blobObjectKey(this.options.vaultId, common.contentHash);
         this.options.status.blobsPending++;
         this.options.status.refresh();
-        try { await blob.upload(key, bytes); }
+        try {
+          await blob.upload(key, bytes);
+          this.options.status.attachmentState = "CONFIGURED";
+          this.options.status.attachmentError = "";
+        } catch (error) {
+          this.options.status.attachmentState = "TRANSFER_ERROR";
+          this.options.status.attachmentError = errorSummary(error);
+          throw error;
+        }
         finally { this.options.status.blobsPending--; this.options.status.refresh(); }
         record = { ...common, kind: "blob", blob: { algorithm: "sha256", hash: common.contentHash,
           key, size: bytes.length } };
@@ -668,9 +676,13 @@ export class MarkdownSyncEngine {
       }
       const bytes = await downloadVerified(this.options.blob, record.blob);
       this.options.status.clearError(`blob:${record.fileId}`);
+      this.options.status.attachmentState = "CONFIGURED";
+      this.options.status.attachmentError = "";
       return bytes;
     } catch (error) {
       this.options.status.markError(`blob:${record.fileId}`);
+      this.options.status.attachmentState = "TRANSFER_ERROR";
+      this.options.status.attachmentError = errorSummary(error);
       this.backgroundError("blob.download_failed", error);
       throw error;
     } finally {
