@@ -20,11 +20,11 @@ The CLI SHALL create or inspect a distinct `OBS_<vaultId>_FILES` JetStream KV bu
 - **THEN** the CLI refuses before creating or rotating a vault credential
 
 ### Requirement: Administrator identity and protected secret handoff
-Bootstrap SHALL generate a separate NATS administrator password with cryptographically secure randomness and at least 128 bits of entropy. The administrator identity SHALL be required for subsequent KV bucket and vault-user management, including creation, listing, inspection, rotation, and revocation. The CLI SHALL disclose generated administrator and first-vault credentials once after successful installation through protected output, never in plans, logs, command arguments, or world-readable files. Bootstrap SHALL always retain the administrator credential in its separate protected local record; it SHALL retain the first-vault plaintext credential only with `--keep`. Administrator credentials SHALL NOT be placed in plugin settings, import URIs, or QR codes.
+Bootstrap SHALL generate a separate NATS administrator password with cryptographically secure randomness and at least 128 bits of entropy. The administrator identity SHALL be required for subsequent KV bucket and vault-user management, including creation, listing, inspection, rotation, and revocation. The CLI SHALL disclose generated administrator and first-vault credentials once after successful installation through protected output, never in plans, logs, command arguments, or world-readable files. An explicitly selected `--secrets-output` destination SHALL take precedence over terminal disclosure. Bootstrap SHALL always retain the administrator credential in its separate protected local record; it SHALL retain the first-vault plaintext credential only with `--keep`. Administrator credentials SHALL NOT be placed in plugin settings, import URIs, or QR codes.
 
 #### Scenario: Successful interactive bootstrap
 - **WHEN** installation and verification complete in an interactive terminal
-- **THEN** the CLI displays the administrator and first-vault credentials once with their distinct purposes identified, and displays the vault-only import URI and QR code
+- **THEN** the CLI displays the administrator and first-vault credentials once with their distinct purposes identified, and displays the vault-only import URI and QR code unless `--secrets-output` was selected, in which case it writes the handoff there without credential disclosure to the terminal
 
 #### Scenario: Successful noninteractive bootstrap
 - **WHEN** unattended installation and verification complete
@@ -41,6 +41,10 @@ Bootstrap SHALL generate a separate NATS administrator password with cryptograph
 ### Requirement: Credential lifecycle
 The CLI SHALL provide list, credential rotation, and revocation operations for vault users. It SHALL generate replacement passwords with cryptographically secure randomness and at least 128 bits of entropy, accept administrator secret input without echo or command-line argument leakage, avoid plaintext secret logs and world-readable files, and never grant administrator credentials to the plugin. Vault-user add and rotation SHALL honor `--keep` for the newly generated credential only; without it they SHALL produce a one-time import URI and QR code but retain no vault plaintext password. Revocation SHALL remove any retained record for that vault so it cannot be imported again. Rotation SHALL replace any retained record only after the replacement server credential is verified.
 
+#### Scenario: List vaults without an identifier
+- **WHEN** an operator runs `fos vault list` on a configured installation without a vault ID
+- **THEN** the CLI resolves the managed installation mode, authenticates the administrator, and lists vaults without requiring `--vault-id`
+
 #### Scenario: Rotate one vault password
 - **WHEN** an operator rotates a vault credential
 - **THEN** the CLI updates only that vault's credential, reports a verified replacement connection while preserving bucket contents, and emits a new vault-only import URI and QR code
@@ -53,9 +57,13 @@ The CLI SHALL provide list, credential rotation, and revocation operations for v
 - **WHEN** an operator confirms revocation
 - **THEN** new connections with that user's old credentials are rejected, its retained credential is removed, and other vault users remain usable
 
-### Requirement: List vaults without an identifier
-The CLI SHALL list provisioned vaults without requiring a vault ID and SHALL resolve the managed installation mode when one is available.
+### Requirement: Safe managed authorization updates
+The CLI SHALL update managed NATS authorization without losing the prior valid configuration if validation, writing, or service update fails. In container modes, it SHALL make the updated authorization available to NATS while preserving persistent vault data and other services; connected clients may briefly reconnect. Native mode SHALL reload the updated authorization.
 
-#### Scenario: Bare vault list
-- **WHEN** an operator runs `fos vault list` on a configured installation without `--vault-id`
-- **THEN** the CLI uses the managed installation mode, authenticates the administrator, and lists provisioned vaults
+#### Scenario: Container authorization update
+- **WHEN** an operator adds, rotates, or revokes a vault credential in Docker or Podman mode
+- **THEN** the CLI atomically updates authorization, makes NATS use the new file, preserves bucket data and Caddy, and restores the prior authorization if the update fails
+
+#### Scenario: Native authorization update
+- **WHEN** an operator adds, rotates, or revokes a vault credential in native mode
+- **THEN** the CLI reloads NATS with the validated authorization while preserving bucket data

@@ -70,6 +70,14 @@ The `fos` CLI SHALL run on the target server and provide a guided interactive bo
 - **WHEN** the operator cancels an interactive prompt or plan confirmation
 - **THEN** the CLI restores terminal input and exits without applying the unconfirmed plan
 
+#### Scenario: Interactive bootstrap with explicit secrets output
+- **WHEN** an operator runs bootstrap in a terminal and supplies `--secrets-output`
+- **THEN** the CLI atomically writes generated credentials to the owner-readable protected destination and suppresses credential disclosure to the terminal
+
+#### Scenario: Bootstrap credential recovery after persistence failure
+- **WHEN** service application succeeds but managed-state or protected credential-record persistence fails
+- **THEN** the CLI attempts credential delivery through the selected protected output and reports the original persistence failure even if recovery delivery also fails
+
 ### Requirement: Clear terminal and machine-readable output
 The CLI SHALL provide command-specific help for root commands and nested vault actions. It SHALL use color only for interactive terminal output when color is enabled, and SHALL preserve plain text or explicitly requested JSON output when redirected or when color is disabled. Interactive choices SHALL explain available options and accept keyboard selection; output SHALL identify errors and relevant paths clearly.
 
@@ -143,7 +151,7 @@ Bootstrap SHALL separately offer firewall management, dedicated service accounts
 
 #### Scenario: Firewall is already active
 - **WHEN** the operator selects firewall management and UFW is active
-- **THEN** the CLI adds the required allow rules without broadening or replacing unrelated firewall rules
+- **THEN** the CLI adds the selected SSH and service allow rules, preserves established SSH access, and leaves unrelated firewall rules unchanged
 
 #### Scenario: Backup choice is selected
 - **WHEN** the operator selects backups and provides a destination and retention policy
