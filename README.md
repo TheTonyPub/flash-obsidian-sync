@@ -4,7 +4,8 @@
 [![Master CI build](https://github.com/TheTonyPub/obsidian-flash-sync/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/TheTonyPub/obsidian-flash-sync/actions/workflows/ci.yml?query=branch%3Amaster)
 [![Latest stable release](https://img.shields.io/github/v/release/TheTonyPub/obsidian-flash-sync?include_prereleases=false)](https://github.com/TheTonyPub/obsidian-flash-sync/releases/latest)
 
-`flash-osidian-sync` is a self-hosted Ob
+`flash-osidian-sync` is a self-hosted Obsidian plugin that synchronizes vault content through a pre-provisioned NATS JetStream KV bucket over WSS. It is not yet distributed through the Obsidian community plugin catalogue
+
 ## Contents
 
 - [Prerequisites](#prerequisites)
@@ -15,7 +16,6 @@
 - [Check connection](#check-connection)
 - [Server bootstrap CLI](#server-bootstrap-cli)
 - [Features](#features)
-sidian plugin that synchronizes vault content through a pre-provisioned NATS JetStream KV bucket over WSS. It is not yet distributed through the Obsidian community plugin catalogue
 
 ## Prerequisites
 
