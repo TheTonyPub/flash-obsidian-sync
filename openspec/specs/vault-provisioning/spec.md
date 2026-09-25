@@ -51,10 +51,6 @@ The CLI SHALL provide list, credential rotation, and revocation operations for v
 - **WHEN** an operator runs `fos vault list` on a configured installation without a vault ID
 - **THEN** the CLI resolves the managed installation mode, authenticates the administrator, and lists vaults without requiring `--vault-id`
 
-#### Scenario: List vaults without an identifier
-- **WHEN** an operator runs `fos vault list` on a configured installation without a vault ID
-- **THEN** the CLI resolves the managed installation mode, authenticates the administrator, and lists vaults without requiring `--vault-id`
-
 #### Scenario: Rotate one vault password
 - **WHEN** an operator rotates a vault credential
 - **THEN** the CLI updates only that vault's credential, reports a verified replacement connection while preserving bucket contents, and emits a new vault-only import URI and QR code
@@ -92,17 +88,6 @@ The CLI SHALL maintain its fixed managed credential store in a root-owned locati
 #### Scenario: One-time vault handoff
 - **WHEN** bootstrap or vault-user creation completes without `--keep`
 - **THEN** the CLI delivers the import URI and QR code once through the selected protected output but retains no plaintext vault credential for later import
-
-### Requirement: Safe managed authorization updates
-The CLI SHALL update managed NATS authorization without losing the prior valid configuration if validation, writing, or service update fails. In container modes, it SHALL make the updated authorization available to NATS while preserving persistent vault data and other services; connected clients may briefly reconnect. Native mode SHALL reload the updated authorization.
-
-#### Scenario: Container authorization update
-- **WHEN** an operator adds, rotates, or revokes a vault credential in Docker or Podman mode
-- **THEN** the CLI atomically updates authorization, makes NATS use the new file, preserves bucket data and Caddy, and restores the prior authorization if the update fails
-
-#### Scenario: Native authorization update
-- **WHEN** an operator adds, rotates, or revokes a vault credential in native mode
-- **THEN** the CLI reloads NATS with the validated authorization while preserving bucket data
 
 ### Requirement: Protected bootstrap recovery output
 When `--secrets-output` is explicitly supplied, the CLI SHALL write generated bootstrap credentials to that protected destination even in an interactive terminal, and SHALL not disclose those credentials to terminal output. If managed-state or credential-record persistence fails after services are applied, the CLI SHALL attempt to deliver credentials through the selected protected output and SHALL preserve the original failure as the reported error.
