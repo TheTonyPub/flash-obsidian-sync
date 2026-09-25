@@ -82,4 +82,86 @@ describe("file lifecycle", () => {
     expect(a.vault.listMarkdown().map((entry) => entry.content).sort()).toEqual(["local", "remote"]);
     a.engine.stop(); await a.engine.settle(); a.store.close();
   });
+
+  it.each(["delete-before-rename", "rename-before-delete"] as const)(
+    "converges a live peer when A's tombstone and B's path reuse arrive %s",
+    async (order) => {
+      const kv = new NatsKvDouble();
+      const sender = await replica("sender", kv, "notes/todo.md", "A");
+      const peer = await replica("peer", kv);
+      await sender.engine.capture("notes/todo_diff.md", "B");
+      const fileA = (await sender.store.getFileByPath("notes/todo.md"))!;
+      const fileB = (await sender.store.getFileByPath("notes/todo_diff.md"))!;
+      if (order === "rename-before-delete") {
+        sender.vault.delete("notes/todo.md");
+        sender.vault.rename("notes/todo_diff.md", "notes/todo.md");
+        await sender.engine.rename("notes/todo_diff.md", "notes/todo.md");
+        await sender.engine.remove("notes/todo.md");
+      } else {
+        sender.vault.delete("notes/todo.md");
+        await sender.engine.remove("notes/todo.md");
+        sender.vault.rename("notes/todo_diff.md", "notes/todo.md");
+        await sender.engine.rename("notes/todo_diff.md", "notes/todo.md");
+      }
+      await peer.engine.settle();
+
+      expect(decodeRecord(kv.get(`f.${fileA.fileId}`)!.value).deleted).toBe(true);
+      expect(decodeRecord(kv.get(`f.${fileB.fileId}`)!.value).path).toBe("notes/todo.md");
+      expect(text(peer.vault.read("notes/todo.md"))).toBe("B");
+      expect(await peer.store.unresolvedConflicts()).toEqual([]);
+      sender.engine.stop(); peer.engine.stop(); await sender.engine.settle(); await peer.engine.settle();
+      sender.store.close(); peer.store.close();
+    },
+  );
+
+  it("reconciles a full remote snapshot with B at A's former path and A tombstoned", async () => {
+    const kv = new NatsKvDouble();
+    const sender = await replica("sender", kv, "notes/todo.md", "A");
+    const fileA = (await sender.store.getFileByPath("notes/todo.md"))!;
+    await sender.engine.capture("notes/todo_diff.md", "B");
+    const fileB = (await sender.store.getFileByPath("notes/todo_diff.md"))!;
+    const currentA = kv.get(`f.${fileA.fileId}`)!;
+    const recordA = decodeRecord(currentA.value);
+    kv.update(`f.${fileA.fileId}`, encodeRecord({ ...recordA, deleted: true, content: undefined,
+      origin: { deviceId: "sender", operationId: "delete-A", clientTime: 2 } }), currentA.revision);
+    const currentB = kv.get(`f.${fileB.fileId}`)!;
+    const recordB = decodeRecord(currentB.value);
+    kv.update(`f.${fileB.fileId}`, encodeRecord({ ...recordB, path: "notes/todo.md",
+      origin: { deviceId: "sender", operationId: "rename-B", clientTime: 3 } }), currentB.revision);
+    sender.engine.stop(); sender.store.close();
+
+    const receiver = await replica("receiver", kv);
+    expect(text(receiver.vault.read("notes/todo.md"))).toBe("B");
+    expect((await receiver.store.getFile(fileA.fileId))?.deleted).toBe(true);
+    expect((await receiver.store.getFile(fileB.fileId))?.path).toBe("notes/todo.md");
+    expect(await receiver.store.unresolvedConflicts()).toEqual([]);
+    receiver.engine.stop(); await receiver.engine.settle(); receiver.store.close();
+  });
+
+  it("does not delete B when A's stale tombstone is applied after B owns A's old path", async () => {
+    const kv = new NatsKvDouble();
+    const receiver = await replica("receiver", kv);
+    const aId = "file-a";
+    const bId = "file-b";
+    await receiver.store.putFile({ fileId: aId, path: "notes/todo.md", localHash: sha256Hex(bytes("A")),
+      remoteHash: sha256Hex(bytes("A")), deleted: true, kind: "text", state: "synced" });
+    await receiver.store.putFile({ fileId: bId, path: "notes/todo_diff.md", localHash: sha256Hex(bytes("B")),
+      remoteHash: sha256Hex(bytes("B")), kind: "text", state: "synced" });
+    receiver.vault.files.set("notes/todo.md", bytes("B"));
+    const tombstone = { schemaVersion: 1 as const, fileId: aId, path: "notes/todo.md", kind: "text" as const,
+      deleted: true, contentHash: sha256Hex(bytes("A")), size: 1,
+      origin: { deviceId: "remote", operationId: "delete-A", clientTime: 2 } };
+    const liveB = { schemaVersion: 1 as const, fileId: bId, path: "notes/todo.md", kind: "text" as const,
+      deleted: false, contentHash: sha256Hex(bytes("B")), size: 1, content: "B",
+      origin: { deviceId: "remote", operationId: "rename-B", clientTime: 3 } };
+    const aRevision = kv.create(`f.${aId}`, encodeRecord(tombstone));
+    const bRevision = kv.create(`f.${bId}`, encodeRecord(liveB));
+    await receiver.engine.reconcile();
+    expect(text(receiver.vault.read("notes/todo.md"))).toBe("B");
+    expect((await receiver.store.getFile(aId))?.deleted).toBe(true);
+    expect((await receiver.store.getFile(bId))?.remoteRevision).toBe(bRevision);
+    expect(aRevision).toBeLessThan(bRevision);
+    receiver.engine.stop(); await receiver.engine.settle(); receiver.store.close();
+  });
+
 });

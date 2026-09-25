@@ -24,6 +24,7 @@ export interface OutboxOperation {
   baseRevision?: number;
   baseHash?: string;
   basePath?: string;
+  predecessorOperationId?: string;
   retryCount: number;
   lastError?: string;
   nextAttemptAt?: number;
@@ -212,6 +213,37 @@ export class LocalStore {
     } else {
       store.add(operation);
     }
+    await done;
+  }
+
+  async queuePathReuse(operation: OutboxOperation, entry: FileIndexEntry, releasedFileId?: string): Promise<void> {
+    const transaction = this.database.transaction(["files", "outbox"], "readwrite");
+    const done = complete(transaction);
+    const files = transaction.objectStore("files");
+    const outbox = transaction.objectStore("outbox");
+    const pathEntries = await request<FileIndexEntry[]>(files.index("path").getAll(operation.path));
+    const owner = releasedFileId
+      ? pathEntries.find((item) => item.fileId === releasedFileId && item.fileId !== operation.fileId)
+      : undefined;
+    let predecessor = owner
+      ? (await request<OutboxOperation[]>(outbox.index("fileId").getAll(owner.fileId)))
+        .find((item) => item.type === "delete")
+      : undefined;
+    if (owner && !predecessor && !(owner.deleted && owner.state === "synced")) {
+      predecessor = {
+        operationId: crypto.randomUUID(), fileId: owner.fileId, type: "delete", path: owner.path,
+        localHash: owner.localHash, baseHash: owner.remoteHash, baseRevision: owner.remoteRevision,
+        baseContent: owner.baseContent, retryCount: 0, createdAt: Date.now(),
+      };
+      outbox.add(predecessor);
+      files.put({ ...owner, deleted: true, state: "pending" });
+    }
+
+    const dependent = predecessor
+      ? { ...operation, predecessorOperationId: predecessor.operationId }
+      : operation;
+    outbox.add(dependent);
+    files.put(entry);
     await done;
   }
 

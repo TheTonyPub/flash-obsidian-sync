@@ -152,14 +152,20 @@ export class MarkdownSyncEngine {
     const { store, vault, status } = this.options;
     const indexed = await store.getFileByPath(from);
     if (!indexed) return;
+    if (await vault.read(from)) {
+      this.conflict();
+      return;
+    }
     const bytes = await vault.read(to);
     if (!bytes) throw new Error("Renamed file is missing");
     const content = to.endsWith(".md") ? new TextDecoder().decode(bytes) : undefined;
-    await store.queue({ operationId: crypto.randomUUID(), fileId: indexed.fileId, type: "rename", path: to,
+    const pathEntries = (await store.files()).filter((item) => item.fileId !== indexed.fileId && item.path === to);
+    const releasedFileId = !await vault.read(from) && pathEntries.length === 1 ? pathEntries[0].fileId : undefined;
+    const operation: OutboxOperation = { operationId: crypto.randomUUID(), fileId: indexed.fileId, type: "rename", path: to,
       basePath: from, localHash: sha256Hex(bytes), content, bytes: content === undefined ? bytes : undefined,
       kind: content === undefined ? "blob" : "text", baseContent: indexed.baseContent,
-      baseHash: indexed.remoteHash, baseRevision: indexed.remoteRevision, retryCount: 0, createdAt: Date.now() });
-    await store.putFile({ ...indexed, path: to, localHash: sha256Hex(bytes), state: "pending" });
+      baseHash: indexed.remoteHash, baseRevision: indexed.remoteRevision, retryCount: 0, createdAt: Date.now() };
+    await store.queuePathReuse(operation, { ...indexed, path: to, localHash: operation.localHash, state: "pending" }, releasedFileId);
     status.pending = (await store.pending()).length; status.refresh();
     await this.replayPending();
   }
@@ -168,6 +174,12 @@ export class MarkdownSyncEngine {
     path = normalizePath(path);
     if (await this.isLocalOnlyArtifactPath(path)) return;
     const { store, status } = this.options;
+    const local = await this.options.vault.read(path);
+    if (local) {
+      const identities = await store.files();
+      if (identities.some((entry) => entry.path === path && entry.deleted) &&
+          identities.some((entry) => entry.path === path && !entry.deleted)) return;
+    }
     const indexed = await store.getFileByPath(path);
     if (!indexed) return;
     await store.queue({ operationId: crypto.randomUUID(), fileId: indexed.fileId, type: "delete", path,
@@ -396,7 +408,12 @@ export class MarkdownSyncEngine {
       localScanMs = Math.round(performance.now() - localScanStartedAt);
       stage = "remote_list";
       const remoteListStartedAt = performance.now();
-      const remote = await kv.list();
+      const remote = (await kv.list()).sort((left, right) => {
+        try {
+          return Number(decodeRecord(right.value).deleted) - Number(decodeRecord(left.value).deleted);
+        } catch { return 0; }
+      });
+      await this.recoverPathReuse(local, remote);
       remoteListMs = Math.round(performance.now() - remoteListStartedAt);
       this.options.logger?.debug("reconcile.snapshot", { localFiles: local.length, remoteFiles: remote.length });
       stage = "remote_apply";
@@ -535,6 +552,41 @@ export class MarkdownSyncEngine {
       lastAppliedRemoteHash: record.contentHash, deleted: record.deleted, state: "synced" };
   }
 
+  private async recoverPathReuse(local: Array<{ path: string; bytes: Uint8Array }>,
+    remote: Array<{ value: Uint8Array }>): Promise<void> {
+    const { store } = this.options;
+    const indexed = await store.files();
+    const remoteById = new Map(remote.flatMap((entry) => {
+      try {
+        const record = decodeRecord(entry.value);
+        return [[record.fileId, record] as const];
+      } catch { return []; }
+    }));
+    const localPaths = new Set(local.map((file) => normalizePath(file.path)));
+    for (const file of local) {
+      const path = normalizePath(file.path);
+      const owners = indexed.filter((entry) => entry.path === path);
+      if (owners.length !== 1) continue;
+      const owner = owners[0];
+      const hash = sha256Hex(file.bytes);
+      if (!owner.deleted && owner.localHash === hash) continue;
+      const candidates = indexed.filter((entry) => entry.fileId !== owner.fileId && !entry.deleted &&
+        entry.path !== path && !localPaths.has(entry.path) && entry.localHash === hash);
+      if (candidates.length !== 1) continue;
+      const renamed = candidates[0];
+      const remoteRecord = remoteById.get(renamed.fileId);
+      if (remoteRecord && !remoteRecord.deleted && remoteRecord.path === path) continue;
+      const content = path.endsWith(".md") ? new TextDecoder().decode(file.bytes) : undefined;
+      const operation: OutboxOperation = {
+        operationId: crypto.randomUUID(), fileId: renamed.fileId, type: "rename", path,
+        basePath: renamed.path, localHash: hash, content, bytes: content === undefined ? file.bytes.slice() : undefined,
+        kind: content === undefined ? "blob" : "text", baseContent: renamed.baseContent,
+        baseHash: renamed.remoteHash, baseRevision: renamed.remoteRevision, retryCount: 0, createdAt: Date.now(),
+      };
+      await store.queuePathReuse(operation, { ...renamed, path, localHash: hash, state: "pending" }, owner.fileId);
+    }
+  }
+
   private replayPending(force = false): Promise<void> {
     const next = this.replayChain.catch(() => {}).then(() => this.publishPending(force));
     this.replayChain = next;
@@ -555,10 +607,25 @@ export class MarkdownSyncEngine {
         continue;
       }
       try {
+        if (operation.predecessorOperationId) {
+          const predecessor = (await store.pending()).find((item) => item.operationId === operation.predecessorOperationId);
+          if (predecessor) {
+            const head = await this.options.kv.get(`f.${predecessor.fileId}`);
+            if (!head) continue;
+            const record = decodeRecord(head.value);
+            if (!record.deleted || record.origin.operationId !== predecessor.operationId) continue;
+            await this.acknowledge(predecessor, record, head.revision);
+          }
+        }
         this.options.logger?.debug("outbox.publish", { operationType: operation.type, retryCount: operation.retryCount });
         await this.publishOne(operation);
         this.options.logger?.debug("outbox.published", { operationType: operation.type });
         status.clearError(`outbox:${operation.fileId}`);
+        if (operation.type === "delete") {
+          for (const dependent of await store.pending()) {
+            if (dependent.predecessorOperationId === operation.operationId) processed.delete(dependent.operationId);
+          }
+        }
       } catch (error) {
         status.lastError = errorSummary(error);
         if (error instanceof BlobStorageUnavailableError) {
@@ -574,9 +641,8 @@ export class MarkdownSyncEngine {
         if (bytes && chooseStorage(operation.path, bytes, this.options.inlineLimit ?? DEFAULT_INLINE_LIMIT) === "blob") {
           status.markError(`outbox:${operation.fileId}`);
           blockedFiles.add(operation.fileId);
-          continue;
         }
-        break;
+        continue;
       }
     }
     status.pending = (await store.pending()).length;
@@ -727,7 +793,9 @@ export class MarkdownSyncEngine {
       const current = await kv.get(key);
       if (!current) { await this.options.store.confirm(operation.operationId); return; }
       const remote = decodeRecord(current.value);
-      if (remote.deleted) { await this.acknowledge(operation, remote, current.revision); return; }
+      if (remote.deleted && remote.origin.operationId === operation.operationId) {
+        await this.acknowledge(operation, remote, current.revision); return;
+      }
       if (operation.operationId.startsWith("resolve-") && current.revision !== operation.baseRevision) {
         await this.returnResolutionToReview(operation, "remote-revision-changed");
         return;
@@ -852,13 +920,29 @@ export class MarkdownSyncEngine {
     return copyPath;
   }
 
+  private async isOccupiedByOtherIdentity(fileId: string, path: string, localHash: string | undefined,
+    identities: FileIndexEntry[]): Promise<boolean> {
+    const normalized = path.toLocaleLowerCase();
+    for (const entry of identities) {
+      if (entry.fileId === fileId || entry.deleted) continue;
+      if (entry.path.toLocaleLowerCase() === normalized) return true;
+      if (!localHash || entry.localHash !== localHash || entry.path === path) continue;
+      if (!await this.options.vault.read(entry.path)) return true;
+    }
+    return false;
+  }
+
   private async acknowledge(operation: OutboxOperation, record: RemoteFileRecord, revision: number): Promise<void> {
     const indexed = await this.options.store.getFile(operation.fileId);
     const latest = (await this.options.store.pending()).find((item) => item.operationId === operation.operationId);
     const hasNewer = latest && (latest.localHash !== operation.localHash || latest.content !== operation.content);
     if (record.deleted) {
       const path = indexed?.path ?? operation.path;
-      if (await this.options.vault.read(path)) {
+      const local = await this.options.vault.read(path);
+      const localHash = local && sha256Hex(local);
+      const identities = await this.options.store.files();
+      const occupiedByOther = await this.isOccupiedByOtherIdentity(operation.fileId, path, localHash, identities);
+      if (local && localHash === indexed?.localHash && !occupiedByOther) {
         this.deleteGuards.add(path);
         await this.options.vault.remove?.(path);
       }
@@ -946,11 +1030,14 @@ export class MarkdownSyncEngine {
     if (record.deleted) {
       if (current && !current.deleted) {
         const local = await vault.read(current.path);
-        if (local && sha256Hex(local) !== current.localHash) {
+        const localHash = local && sha256Hex(local);
+        const identities = await store.files();
+        const occupiedByOther = await this.isOccupiedByOtherIdentity(current.fileId, current.path, localHash, identities);
+        if (local && localHash !== current.localHash && !occupiedByOther) {
           await this.capture(current.path, new TextDecoder().decode(local));
           return;
         }
-        if (local) {
+        if (local && !occupiedByOther) {
           this.deleteGuards.add(current.path);
           await vault.remove?.(current.path);
         }

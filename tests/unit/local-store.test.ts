@@ -48,6 +48,46 @@ describe("IndexedDB local state", () => {
     store.close();
   });
 
+  it("atomically stores a synthesized path release and its dependent rename", async () => {
+    const store = await open(`state-${crypto.randomUUID()}`);
+    const released = { fileId: "file-a", path: "notes/a.md", localHash: "hash-a", remoteHash: "base-a",
+      remoteRevision: 1, baseContent: "A", state: "synced" as const };
+    const reused = { fileId: "file-b", path: "notes/b.md", localHash: "hash-b", remoteHash: "base-b",
+      remoteRevision: 2, baseContent: "B", state: "synced" as const };
+    await store.putFile(released);
+    await store.putFile(reused);
+    await store.queuePathReuse({ ...operation("rename-b", "B"), fileId: reused.fileId, type: "rename",
+      path: released.path, basePath: reused.path, baseRevision: reused.remoteRevision, baseHash: reused.remoteHash },
+    { ...reused, path: released.path, state: "pending" }, released.fileId);
+
+    const pending = await store.pending();
+    const deletion = pending.find((item) => item.fileId === released.fileId);
+    const rename = pending.find((item) => item.fileId === reused.fileId);
+    expect(deletion?.type).toBe("delete");
+    expect(rename?.predecessorOperationId).toBe(deletion?.operationId);
+    expect((await store.getFile(released.fileId))?.deleted).toBe(true);
+    expect((await store.getFile(reused.fileId))?.path).toBe(released.path);
+    store.close();
+  });
+
+  it("does not synthesize deletion for an ambiguous path owner", async () => {
+    const store = await open(`state-${crypto.randomUUID()}`);
+    await store.putFile({ fileId: "file-a", path: "notes/a.md", localHash: "hash-a", state: "synced" });
+    await store.putFile({ fileId: "file-c", path: "notes/a.md", localHash: "hash-c", state: "synced" });
+    const reused = { fileId: "file-b", path: "notes/b.md", localHash: "hash-b", state: "synced" as const };
+    await store.putFile(reused);
+
+    await store.queuePathReuse({ ...operation("rename-b", "B"), fileId: reused.fileId, type: "rename",
+      path: "notes/a.md", basePath: reused.path }, { ...reused, path: "notes/a.md", state: "pending" });
+
+    const pending = await store.pending();
+    expect(pending.map((item) => item.type)).toEqual(["rename"]);
+    expect(pending[0]?.predecessorOperationId).toBeUndefined();
+    expect((await store.getFile("file-a"))?.deleted).toBeFalsy();
+    expect((await store.getFile("file-c"))?.deleted).toBeFalsy();
+    store.close();
+  });
+
   it("does not coalesce across different base revisions", async () => {
     const store = await open(`state-${crypto.randomUUID()}`);
     await store.queue(operation("op-1", "first"));
