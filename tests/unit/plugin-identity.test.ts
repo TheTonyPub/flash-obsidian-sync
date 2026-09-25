@@ -3,12 +3,31 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PLUGIN_ID, registerImportUriHandlers } from "../../packages/plugin/src/plugin-identity.js";
 import EasySyncPlugin from "../../packages/plugin/src/main.js";
-import { pluginInstances } from "../doubles/obsidian.js";
+import { Plugin, pluginInstances } from "../doubles/obsidian.js";
+
+vi.mock("obsidian", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("obsidian")>();
+  return { ...actual, setIcon: () => {} };
+});
 
 const manifestPath = fileURLToPath(new URL("../../packages/plugin/manifest.json", import.meta.url));
 
+function statusBarFixture(): HTMLElement {
+  const item = {
+    style: { color: "" },
+    tabIndex: 0,
+    classList: { add: () => {}, remove: () => {} },
+    empty: () => {},
+    setAttribute: () => {},
+    addEventListener: () => {},
+    createSpan: () => item,
+  };
+  return item as unknown as HTMLElement;
+}
+
 afterEach(() => {
   pluginInstances.length = 0;
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -50,6 +69,7 @@ describe("Flash Sync plugin identity", () => {
     vi.stubGlobal("document", { hidden: false });
     vi.stubGlobal("window", {});
     vi.stubGlobal("indexedDB", { databases, open });
+    vi.spyOn(Plugin.prototype, "addStatusBarItem").mockReturnValue(statusBarFixture() as never);
     const plugin = new EasySyncPlugin(app as never, {} as never);
 
     await plugin.onload();

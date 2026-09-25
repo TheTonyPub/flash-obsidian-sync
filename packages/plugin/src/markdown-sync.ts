@@ -1,9 +1,16 @@
 import { createFileId, decodeRecord, encodeRecord, normalizePath, sha256Hex, type RemoteFileRecord } from "@flash-osidian-sync/protocol";
 import { type KvPort, type SyncStatus } from "./connection.js";
-import { type FileIndexEntry, type LocalStore, type OutboxOperation } from "./local-store.js";
+import { type ConflictRecord, type FileIndexEntry, type LocalStore, type OutboxOperation } from "./local-store.js";
 import { conflictCopyId, conflictCopyPath, resolveMarkdown } from "./conflict-resolution.js";
 import { blobObjectKey, chooseStorage, DEFAULT_INLINE_LIMIT, downloadVerified, type BlobPort } from "./blob-storage.js";
 import { errorSummary, type PluginLogger } from "./diagnostics.js";
+
+/** Local-only notes created by the conflict review UI. */
+export const CONFLICT_REVIEW_FOLDER = "Flash Sync Conflict Reviews";
+
+function isConflictReviewPath(path: string): boolean {
+  return path === CONFLICT_REVIEW_FOLDER || path.startsWith(`${CONFLICT_REVIEW_FOLDER}/`);
+}
 
 export interface MarkdownVault {
   read(path: string): Uint8Array | undefined | Promise<Uint8Array | undefined>;
@@ -60,6 +67,12 @@ export class MarkdownSyncEngine {
 
   constructor(private readonly options: MarkdownSyncOptions) {}
 
+  private async isLocalOnlyArtifactPath(path: string): Promise<boolean> {
+    if (isConflictReviewPath(path)) return true;
+    return (await this.options.store.conflicts()).some((conflict) =>
+      conflict.copyPath === path || conflict.recoveryBackup?.path === path);
+  }
+
   async start(): Promise<void> {
     this.stopped = false;
     this.buffering = true;
@@ -67,8 +80,8 @@ export class MarkdownSyncEngine {
     this.options.status.reconciled = false;
     this.options.status.refresh();
     this.stopVault = this.options.vault.onModify((path) => {
-      void Promise.resolve().then(() => this.options.vault.read(path)).then((bytes) => {
-        if (this.stopped || !bytes) return;
+      void Promise.resolve().then(() => this.options.vault.read(path)).then(async (bytes) => {
+        if (this.stopped || !bytes || await this.isLocalOnlyArtifactPath(path)) return;
         const hash = sha256Hex(bytes);
         if (this.applyGuards.get(path) === hash) {
           this.applyGuards.delete(path);
@@ -108,7 +121,7 @@ export class MarkdownSyncEngine {
   }
 
   scheduleCapture(path: string, content: string): void {
-    if (this.stopped) return;
+    if (this.stopped || isConflictReviewPath(path)) return;
     const previous = this.timers.get(path);
     if (previous) clearTimeout(previous);
     const timer = setTimeout(() => {
@@ -119,12 +132,14 @@ export class MarkdownSyncEngine {
   }
 
   async capture(path: string, content: string): Promise<void> {
+    if (await this.isLocalOnlyArtifactPath(path)) return;
     const next = this.captureChain.catch(() => {}).then(() => this.captureOne(path, new TextEncoder().encode(content), content));
     this.captureChain = next;
     await next;
   }
 
   async captureBytes(path: string, bytes: Uint8Array): Promise<void> {
+    if (await this.isLocalOnlyArtifactPath(path)) return;
     const content = path.endsWith(".md") ? new TextDecoder().decode(bytes) : undefined;
     const next = this.captureChain.catch(() => {}).then(() => this.captureOne(path, bytes, content));
     this.captureChain = next;
@@ -133,7 +148,7 @@ export class MarkdownSyncEngine {
 
   async rename(from: string, to: string): Promise<void> {
     from = normalizePath(from); to = normalizePath(to);
-    if (from === to) return;
+    if (from === to || await this.isLocalOnlyArtifactPath(from) || isConflictReviewPath(to)) return;
     const { store, vault, status } = this.options;
     const indexed = await store.getFileByPath(from);
     if (!indexed) return;
@@ -151,6 +166,7 @@ export class MarkdownSyncEngine {
 
   async remove(path: string): Promise<void> {
     path = normalizePath(path);
+    if (await this.isLocalOnlyArtifactPath(path)) return;
     const { store, status } = this.options;
     const indexed = await store.getFileByPath(path);
     if (!indexed) return;
@@ -162,8 +178,160 @@ export class MarkdownSyncEngine {
     await this.replayPending();
   }
 
+  /** Live, anchored comparison consumed by the conflict view. */
+  async compareConflict(operationId: string): Promise<{ remote: Record<string, unknown>; local: Record<string, unknown>; stale: { remote: boolean; local: boolean } }> {
+    const record = await this.requireConflict(operationId);
+    const head = await this.options.kv.get(`f.${record.originalFileId}`);
+    if (!head) throw new Error("Conflict remote record is missing");
+    const remote = decodeRecord(head.value);
+    const copy = await this.options.vault.read(record.copyPath);
+    const localHash = copy ? sha256Hex(copy) : undefined;
+    const reviewableBlob = remote.kind === "blob" && remote.path.endsWith(".md") &&
+      remote.size <= (this.options.inlineLimit ?? DEFAULT_INLINE_LIMIT);
+    let metadataOnly = (remote.kind === "blob" && !reviewableBlob) ||
+      remote.size > (this.options.inlineLimit ?? DEFAULT_INLINE_LIMIT);
+    let remoteContent = remote.content;
+    let localContent = copy ? new TextDecoder().decode(copy) : undefined;
+    if (reviewableBlob) {
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      try {
+        remoteContent = decoder.decode(await this.loadRecordBytes(remote));
+        localContent = copy ? decoder.decode(copy) : undefined;
+      } catch (error) {
+        if (error instanceof TypeError) {
+          metadataOnly = true;
+          remoteContent = undefined;
+          localContent = undefined;
+        } else throw error;
+      }
+    }
+    return {
+      remote: { path: remote.path, hash: remote.contentHash, size: remote.size, revision: head.revision,
+        ...(!metadataOnly && remoteContent !== undefined ? { content: remoteContent } : {}) },
+      local: { path: record.copyPath, hash: localHash, size: copy?.length,
+        ...(!metadataOnly && localContent !== undefined ? { content: localContent } : {}) },
+      stale: { remote: !!record.detectionRemoteHash && remote.contentHash !== record.detectionRemoteHash,
+        local: !!record.detectionCopyHash && localHash !== record.detectionCopyHash },
+    };
+  }
+
+  async keepRemote(operationId: string): Promise<void> {
+    const { record, remote, head, canonical } = await this.validatedAction(operationId);
+    const remoteBytes = await this.loadRecordBytes(remote);
+    const backup = await this.backupCanonical(record, canonical);
+    this.applyGuards.set(record.canonicalPath ?? record.originalPath, remote.contentHash);
+    await this.options.vault.write(record.canonicalPath ?? record.originalPath, remoteBytes);
+    await this.options.store.putFile(this.syncedIndex(remote, head.revision));
+    await this.options.store.updateConflict(operationId, { lifecycle: "resolved", recoveryBackup: backup });
+    await this.options.store.appendConflictHistory({ operationId, event: "resolved", outcome: "keep-remote" });
+    await this.refreshConflicts();
+  }
+
+  async keepLocalCopy(operationId: string): Promise<void> {
+    const { record, remote, head, canonical } = await this.validatedAction(operationId);
+    const copy = await this.options.vault.read(record.copyPath);
+    if (!copy) throw new Error("Conflict copy is missing");
+    const hash = sha256Hex(copy);
+    if (record.detectionCopyHash && hash !== record.detectionCopyHash) throw new Error("Conflict copy changed; refresh conflict review");
+    const backup = await this.backupCanonical(record, canonical);
+    const path = record.canonicalPath ?? record.originalPath;
+    this.applyGuards.set(path, hash);
+    await this.options.vault.write(path, copy);
+    await this.options.store.queue({ operationId: `resolve-${operationId}`, fileId: record.originalFileId, type: "modify", path,
+      localHash: hash, content: path.endsWith(".md") ? new TextDecoder().decode(copy) : undefined,
+      bytes: path.endsWith(".md") ? undefined : copy, kind: path.endsWith(".md") ? "text" : "blob",
+      baseRevision: head.revision, baseHash: remote.contentHash, retryCount: 0, createdAt: Date.now() });
+    await this.options.store.putFile({ fileId: record.originalFileId, path, localHash: hash, remoteHash: remote.contentHash,
+      remoteRevision: head.revision, kind: remote.kind, state: "pending" });
+    await this.options.store.updateConflict(operationId, { lifecycle: "pending-sync", recoveryBackup: backup });
+    await this.options.store.appendConflictHistory({ operationId, event: "pending", outcome: "keep-local-copy" });
+    await this.refreshConflicts();
+    void this.replayPending().catch((error: unknown) => this.backgroundError("resolution.publish_failed", error));
+  }
+
+  async markResolved(operationId: string): Promise<void> {
+    const record = await this.requireConflict(operationId);
+    const head = await this.options.kv.get(`f.${record.originalFileId}`);
+    if (!head) throw new Error("Conflict remote record is missing");
+    const remote = decodeRecord(head.value);
+    const path = record.canonicalPath ?? record.originalPath;
+    const local = await this.options.vault.read(path);
+    if (record.remoteRevision !== undefined && head.revision !== record.remoteRevision) throw new Error("Remote changed; refresh conflict review");
+    if (!local || sha256Hex(local) !== remote.contentHash) {
+      const deleted = !local;
+      await this.options.store.queue({ operationId: `resolve-${operationId}`, fileId: record.originalFileId,
+        type: deleted ? "delete" : "modify", path, localHash: local ? sha256Hex(local) : remote.contentHash,
+        content: local && path.endsWith(".md") ? new TextDecoder().decode(local) : undefined,
+        bytes: local && !path.endsWith(".md") ? local : undefined, kind: local && !path.endsWith(".md") ? "blob" : "text",
+        baseRevision: head.revision, baseHash: remote.contentHash, retryCount: 0, createdAt: Date.now() });
+      await this.options.store.updateConflict(operationId, { lifecycle: "pending-sync" });
+      await this.options.store.appendConflictHistory({ operationId, event: "pending", outcome: deleted ? "manual-delete" : "manual-edit" });
+    } else {
+      await this.options.store.updateConflict(operationId, { lifecycle: "resolved" });
+      await this.options.store.appendConflictHistory({ operationId, event: "resolved", outcome: "manual-match" });
+    }
+    await this.refreshConflicts();
+    void this.replayPending().catch((error: unknown) => this.backgroundError("resolution.publish_failed", error));
+  }
+
+  private async requireConflict(operationId: string): Promise<ConflictRecord> {
+    const record = await this.options.store.getConflict(operationId);
+    if (!record) throw new Error(`Unknown conflict: ${operationId}`);
+    if (record.lifecycle === "resolved") throw new Error("Conflict is already resolved");
+    return record;
+  }
+
+  private async validatedAction(operationId: string): Promise<{ record: ConflictRecord; remote: RemoteFileRecord; head: { value: Uint8Array; revision: number }; canonical?: Uint8Array }> {
+    const record = await this.requireConflict(operationId);
+    const head = await this.options.kv.get(`f.${record.originalFileId}`);
+    if (!head) throw new Error("Conflict remote record is missing");
+    const remote = decodeRecord(head.value);
+    const path = record.canonicalPath ?? record.originalPath;
+    const canonical = await this.options.vault.read(path);
+    if (record.remoteRevision !== undefined && head.revision !== record.remoteRevision) throw new Error("Remote changed; refresh conflict review");
+    if (record.detectionRemoteHash && remote.contentHash !== record.detectionRemoteHash) throw new Error("Remote content changed; refresh conflict review");
+    if (record.detectionLocalHash && (!canonical || sha256Hex(canonical) !== record.detectionLocalHash)) {
+      throw new Error("Canonical path changed; refresh conflict review");
+    }
+    return { record, remote, head, canonical };
+  }
+
+  private async backupCanonical(record: ConflictRecord, bytes: Uint8Array | undefined): Promise<ConflictRecord["recoveryBackup"]> {
+    if (!bytes) return undefined;
+    const path = `${record.canonicalPath ?? record.originalPath}.recovery-${record.operationId}`;
+    const hash = sha256Hex(bytes);
+    const existing = await this.options.vault.read(path);
+    if (existing && sha256Hex(existing) !== hash) throw new Error("Recovery backup path occupied");
+    if (!existing) {
+      this.applyGuards.set(path, hash);
+      await this.options.vault.write(path, bytes);
+    }
+    await this.options.store.appendConflictHistory({ operationId: record.operationId, event: "backup", path });
+    return { path, hash, size: bytes.length };
+  }
+
+  private async refreshConflicts(): Promise<void> {
+    const conflicts = await this.options.store.unresolvedConflicts();
+    this.options.status.conflictPaths = conflicts.map((item) => item.copyPath);
+    this.options.status.conflicts = conflicts.length;
+    this.options.status.pending = (await this.options.store.pending()).length;
+    this.options.status.refresh();
+  }
+
+  private async returnResolutionToReview(operation: OutboxOperation, outcome: string): Promise<void> {
+    const operationId = operation.operationId.slice("resolve-".length);
+    await this.options.store.confirm(operation.operationId);
+    const conflict = await this.options.store.getConflict(operationId);
+    if (conflict && conflict.lifecycle !== "resolved") {
+      await this.options.store.updateConflict(operationId, { lifecycle: "unresolved" });
+      await this.options.store.appendConflictHistory({ operationId, event: "stale", outcome });
+    }
+    await this.refreshConflicts();
+  }
+
   private async captureOne(path: string, bytes: Uint8Array, content?: string): Promise<void> {
     path = normalizePath(path);
+    if (await this.isLocalOnlyArtifactPath(path)) return;
     const hash = sha256Hex(bytes);
     const previous = await this.options.store.getFileByPath(path);
     if (previous?.localHash === hash && previous.state === "synced") return;
@@ -192,35 +360,55 @@ export class MarkdownSyncEngine {
 
   private async reconcileOnce(): Promise<void> {
     const { status, store, kv, vault } = this.options;
+    const startedAt = performance.now();
+    let watchSetupMs = 0;
+    let localScanMs = 0;
+    let remoteListMs = 0;
+    let remoteApplyMs = 0;
+    let localApplyMs = 0;
+    let outboxReplayMs = 0;
+    let remoteApplied = 0;
+    let localApplied = 0;
     let stage = "watch";
     status.reconciled = false;
     status.pending = (await store.pending()).length;
-    status.conflictPaths = (await store.conflicts()).map((item) => item.copyPath);
+    status.conflictPaths = (await store.unresolvedConflicts()).map((item) => item.copyPath);
     status.conflicts = status.conflictPaths.length;
     status.refresh();
     this.options.logger?.debug("reconcile.start", { pending: status.pending, conflicts: status.conflicts });
     try {
+      const watchSetupStartedAt = performance.now();
       this.stopWatch?.();
       this.stopWatch = await kv.watch((entry) => {
         if (this.buffering) this.buffered.push(entry);
         else this.queueLive(entry);
       });
+      watchSetupMs = Math.round(performance.now() - watchSetupStartedAt);
       stage = "local_scan";
-      const local = vault.listFiles
+      const localScanStartedAt = performance.now();
+      const generatedPaths = new Set((await store.conflicts()).flatMap((conflict) =>
+        [conflict.copyPath, conflict.recoveryBackup?.path].filter((path): path is string => !!path)));
+      const local = (vault.listFiles
         ? await vault.listFiles()
-        : (await vault.listMarkdown()).map((file) => ({ path: file.path, bytes: new TextEncoder().encode(file.content) }));
+        : (await vault.listMarkdown()).map((file) => ({ path: file.path, bytes: new TextEncoder().encode(file.content) })))
+        .filter((file) => !isConflictReviewPath(file.path) && !generatedPaths.has(file.path));
       const localByPath = new Map(local.map((file) => [file.path, file]));
+      localScanMs = Math.round(performance.now() - localScanStartedAt);
       stage = "remote_list";
+      const remoteListStartedAt = performance.now();
       const remote = await kv.list();
+      remoteListMs = Math.round(performance.now() - remoteListStartedAt);
       this.options.logger?.debug("reconcile.snapshot", { localFiles: local.length, remoteFiles: remote.length });
       stage = "remote_apply";
+      const remoteApplyStartedAt = performance.now();
       const remotePaths = new Set<string>();
       for (const entry of remote) {
         let record: RemoteFileRecord;
         try { record = decodeRecord(entry.value); }
         catch { this.conflict(); continue; }
+        if (isConflictReviewPath(record.path)) continue;
         if (!record.deleted) remotePaths.add(record.path);
-        if (record.deleted) { await this.applyRemote(entry.value, entry.revision); continue; }
+        if (record.deleted) { await this.applyRemote(entry.value, entry.revision); remoteApplied++; continue; }
         const indexed = await store.getFile(record.fileId);
         const existing = localByPath.get(record.path);
         if (!indexed && existing && !await store.getFileByPath(record.path)) {
@@ -237,23 +425,34 @@ export class MarkdownSyncEngine {
           await this.captureBytes(record.path, existing.bytes);
         }
         await this.applyRemote(entry.value, entry.revision);
+        remoteApplied++;
       }
       while (this.buffered.length) {
         const batch = this.buffered.splice(0).sort((a, b) => a.revision - b.revision);
         for (const entry of batch) await this.applyRemote(entry.value, entry.revision);
+        remoteApplied += batch.length;
       }
+      remoteApplyMs = Math.round(performance.now() - remoteApplyStartedAt);
+      stage = "local_apply";
+      const localApplyStartedAt = performance.now();
       for (const file of local) {
         if (!remotePaths.has(file.path) && !await store.getFileByPath(file.path) && await vault.read(file.path)) {
           await this.captureBytes(file.path, file.bytes);
+          localApplied++;
         }
       }
+      localApplyMs = Math.round(performance.now() - localApplyStartedAt);
       await this.captureChain;
       stage = "outbox_replay";
+      const outboxReplayStartedAt = performance.now();
       await this.replayPending(true);
+      outboxReplayMs = Math.round(performance.now() - outboxReplayStartedAt);
     } catch (error) {
       const failure = new Error("Reconciliation failed; local outbox retained", { cause: error });
       status.lastError = errorSummary(failure);
-      this.options.logger?.error("reconcile.failed", failure, { stage, pending: status.pending });
+      this.options.logger?.error("reconcile.failed", failure, {
+        stage, pending: status.pending, durationMs: Math.round(performance.now() - startedAt),
+      });
       status.connected = false;
       status.reconciled = false;
       status.refresh();
@@ -268,7 +467,11 @@ export class MarkdownSyncEngine {
     status.connected = true;
     status.reconciled = true;
     status.refresh();
-    this.options.logger?.debug("reconcile.complete", { pending: status.pending, conflicts: status.conflicts });
+    this.options.logger?.debug("reconcile.complete", {
+      pending: status.pending, conflicts: status.conflicts, remoteApplied, localApplied,
+      watchSetupMs, localScanMs, remoteListMs, remoteApplyMs, localApplyMs, outboxReplayMs,
+      totalDurationMs: Math.round(performance.now() - startedAt),
+    });
   }
 
   private queueLive(entry: Watched): void {
@@ -294,11 +497,16 @@ export class MarkdownSyncEngine {
       this.conflict();
       return false;
     }
+    const bytes = new TextEncoder().encode(localContent);
+    const operationId = `bootstrap-${record.fileId}-${sha256Hex(bytes)}`;
+    await this.options.store.putConflict({ operationId, originalFileId: record.fileId, originalPath: record.path,
+      copyFileId: conflictCopyId(record.fileId, operationId), copyPath: path, remoteRevision: (await this.options.kv.get(`f.${record.fileId}`))?.revision ?? 0,
+      lifecycle: "unresolved", context: "bootstrap", canonicalPath: record.path, remotePath: record.path,
+      detectionRemoteHash: record.contentHash, detectionLocalHash: sha256Hex(bytes), detectionCopyHash: sha256Hex(bytes), kind: record.kind, size: record.size });
+    await this.options.store.appendConflictHistory({ operationId, event: "detected", context: "bootstrap", path });
     if (!existing) {
-      const bytes = new TextEncoder().encode(localContent);
       this.applyGuards.set(path, sha256Hex(bytes));
       await this.options.vault.write(path, bytes);
-      await this.capture(path, localContent);
     }
     return true;
   }
@@ -307,10 +515,15 @@ export class MarkdownSyncEngine {
     const path = this.collisionPath(record.path, record.fileId);
     const existing = await this.options.vault.read(path);
     if (existing && sha256Hex(existing) !== sha256Hex(bytes)) { this.conflict(); return false; }
+    const operationId = `bootstrap-${record.fileId}-${sha256Hex(bytes)}`;
+    await this.options.store.putConflict({ operationId, originalFileId: record.fileId, originalPath: record.path,
+      copyFileId: conflictCopyId(record.fileId, operationId), copyPath: path, remoteRevision: (await this.options.kv.get(`f.${record.fileId}`))?.revision ?? 0,
+      lifecycle: "unresolved", context: "bootstrap", canonicalPath: record.path, remotePath: record.path,
+      detectionRemoteHash: record.contentHash, detectionLocalHash: sha256Hex(bytes), detectionCopyHash: sha256Hex(bytes), kind: record.kind, size: record.size });
+    await this.options.store.appendConflictHistory({ operationId, event: "detected", context: "bootstrap", path });
     if (!existing) {
       this.applyGuards.set(path, sha256Hex(bytes));
       await this.options.vault.write(path, bytes);
-      await this.captureBytes(path, bytes);
     }
     return true;
   }
@@ -381,6 +594,16 @@ export class MarkdownSyncEngine {
       const localContent = operation.content;
       if (remote?.origin.operationId === operation.operationId && remote.contentHash === operation.localHash) {
         await this.acknowledge(operation, remote, current!.revision);
+        return;
+      }
+      // A remote write can contain the exact bytes we intend to publish while using
+      // a different representation. There is no divergence to preserve as a conflict.
+      if (remote && !remote.deleted && remote.contentHash === operation.localHash) {
+        await this.acknowledge(operation, remote, current!.revision);
+        return;
+      }
+      if (operation.operationId.startsWith("resolve-") && current?.revision !== operation.baseRevision) {
+        await this.returnResolutionToReview(operation, "remote-revision-changed");
         return;
       }
       let content = localContent;
@@ -505,6 +728,10 @@ export class MarkdownSyncEngine {
       if (!current) { await this.options.store.confirm(operation.operationId); return; }
       const remote = decodeRecord(current.value);
       if (remote.deleted) { await this.acknowledge(operation, remote, current.revision); return; }
+      if (operation.operationId.startsWith("resolve-") && current.revision !== operation.baseRevision) {
+        await this.returnResolutionToReview(operation, "remote-revision-changed");
+        return;
+      }
       if (current.revision !== operation.baseRevision && remote.contentHash !== operation.baseHash) {
         await this.preserveRemoteEdit(operation, remote, current.revision);
       }
@@ -525,6 +752,16 @@ export class MarkdownSyncEngine {
 
   private async preserveConflict(operation: OutboxOperation, remote: RemoteFileRecord, revision: number): Promise<void> {
     const { store, vault, status } = this.options;
+    const prior = (await store.unresolvedConflicts()).find((entry) =>
+      entry.context === "merge" && entry.originalFileId === operation.fileId);
+    if (prior) {
+      // A restarted CAS retry must retain the original durable record and copy.
+      // Leave this operation in the outbox for refreshed review instead of creating
+      // another copy whose identity is merely a retry UUID.
+      await store.appendConflictHistory({ operationId: prior.operationId, event: "retry", outcome: "preserved" });
+      await this.refreshConflicts();
+      throw new Error("Conflict requires refreshed review");
+    }
     const copyFileId = conflictCopyId(operation.fileId, operation.operationId);
     const copyPath = operation.path.endsWith(".md")
       ? conflictCopyPath(operation.path, this.options.deviceId, operation.createdAt, operation.operationId)
@@ -533,20 +770,16 @@ export class MarkdownSyncEngine {
     const canonical = remote.deleted ? undefined : await this.loadRecordBytes(remote);
     const existing = await vault.read(copyPath);
     if (existing && sha256Hex(existing) !== operation.localHash) throw new Error("Conflict copy path occupied");
-    const alreadyQueued = (await store.pending()).some((item) => item.fileId === copyFileId);
-    if (!alreadyQueued) await store.queue({
-      operationId: `copy-${operation.operationId}`, fileId: copyFileId, type: "create", path: copyPath,
-      localHash: operation.localHash, content: operation.content, bytes: operation.bytes,
-      kind: operation.kind, retryCount: 0, createdAt: operation.createdAt,
-    });
-    await store.putFile({ fileId: copyFileId, path: copyPath, localHash: operation.localHash, state: "pending" });
     if (!existing) {
       this.applyGuards.set(copyPath, operation.localHash);
       await vault.write(copyPath, bytes);
     }
     await store.putConflict({ operationId: operation.operationId, originalFileId: operation.fileId,
-      originalPath: operation.path, copyFileId, copyPath, remoteRevision: revision });
-    status.conflictPaths = (await store.conflicts()).map((item) => item.copyPath);
+      originalPath: operation.path, copyFileId, copyPath, remoteRevision: revision, lifecycle: "unresolved", context: "merge",
+      canonicalPath: remote.path, remotePath: remote.path, detectionRemoteHash: remote.contentHash,
+      detectionLocalHash: operation.localHash, detectionCopyHash: operation.localHash, kind: remote.kind, size: remote.size });
+    await store.appendConflictHistory({ operationId: operation.operationId, event: "detected", context: "merge", path: copyPath });
+    status.conflictPaths = (await store.unresolvedConflicts()).map((item) => item.copyPath);
     status.conflicts = status.conflictPaths.length;
     await store.confirm(operation.operationId);
     if (remote.deleted) {
@@ -574,21 +807,16 @@ export class MarkdownSyncEngine {
       : this.collisionPath(remote.path, copyFileId);
     const existing = await vault.read(copyPath);
     if (existing && sha256Hex(existing) !== remote.contentHash) throw new Error("Conflict copy path occupied");
-    if (!(await store.pending()).some((item) => item.fileId === copyFileId)) {
-      await store.queue({ operationId: `copy-${operation.operationId}`, fileId: copyFileId, type: "create",
-        path: copyPath, content: remote.path.endsWith(".md") ? new TextDecoder().decode(remoteBytes) : undefined,
-        bytes: remote.path.endsWith(".md") ? undefined : remoteBytes,
-        kind: remote.path.endsWith(".md") ? "text" : "blob", localHash: remote.contentHash,
-        retryCount: 0, createdAt: operation.createdAt });
-    }
-    await store.putFile({ fileId: copyFileId, path: copyPath, localHash: remote.contentHash, state: "pending" });
     if (!existing) {
       this.applyGuards.set(copyPath, remote.contentHash);
       await vault.write(copyPath, remoteBytes);
     }
     await store.putConflict({ operationId: operation.operationId, originalFileId: operation.fileId,
-      originalPath: remote.path, copyFileId, copyPath, remoteRevision: revision });
-    status.conflictPaths = (await store.conflicts()).map((item) => item.copyPath);
+      originalPath: remote.path, copyFileId, copyPath, remoteRevision: revision, lifecycle: "unresolved", context: "merge",
+      canonicalPath: remote.path, remotePath: remote.path, detectionRemoteHash: remote.contentHash,
+      detectionLocalHash: operation.localHash, detectionCopyHash: remote.contentHash, kind: remote.kind, size: remote.size });
+    await store.appendConflictHistory({ operationId: operation.operationId, event: "detected", context: "merge", path: copyPath });
+    status.conflictPaths = (await store.unresolvedConflicts()).map((item) => item.copyPath);
     status.conflicts = status.conflictPaths.length; status.refresh();
   }
 
@@ -614,8 +842,12 @@ export class MarkdownSyncEngine {
     if (indexed) await store.putFile({ ...indexed, path: copyPath });
     await store.putConflict({ operationId: `path-${colliding.record.fileId}-${operation.fileId}`,
       originalFileId: colliding.record.fileId, originalPath: path,
-      copyFileId: operation.fileId, copyPath, remoteRevision: colliding.revision });
-    status.conflictPaths = (await store.conflicts()).map((item) => item.copyPath);
+      copyFileId: operation.fileId, copyPath, remoteRevision: colliding.revision, lifecycle: "unresolved", context: "path-collision",
+      canonicalPath: path, remotePath: colliding.record.path, detectionRemoteHash: colliding.record.contentHash,
+      detectionLocalHash: local ? sha256Hex(local) : undefined, detectionCopyHash: local ? sha256Hex(local) : undefined,
+      kind: colliding.record.kind, size: colliding.record.size });
+    await store.appendConflictHistory({ operationId: `path-${colliding.record.fileId}-${operation.fileId}`, event: "detected", context: "path-collision", path: copyPath });
+    status.conflictPaths = (await store.unresolvedConflicts()).map((item) => item.copyPath);
     status.conflicts = status.conflictPaths.length; status.refresh();
     return copyPath;
   }
@@ -623,7 +855,7 @@ export class MarkdownSyncEngine {
   private async acknowledge(operation: OutboxOperation, record: RemoteFileRecord, revision: number): Promise<void> {
     const indexed = await this.options.store.getFile(operation.fileId);
     const latest = (await this.options.store.pending()).find((item) => item.operationId === operation.operationId);
-    const newer = latest && (latest.localHash !== operation.localHash || latest.content !== operation.content);
+    const hasNewer = latest && (latest.localHash !== operation.localHash || latest.content !== operation.content);
     if (record.deleted) {
       const path = indexed?.path ?? operation.path;
       if (await this.options.vault.read(path)) {
@@ -637,13 +869,22 @@ export class MarkdownSyncEngine {
     }
     if (record.content !== undefined) {
       const current = await this.options.vault.read(record.path);
-      if ((!current || sha256Hex(current) !== record.contentHash) && !newer &&
+      if ((!current || sha256Hex(current) !== record.contentHash) && !hasNewer &&
           (!current || sha256Hex(current) === operation.localHash)) {
         this.applyGuards.set(record.path, record.contentHash);
         await this.options.vault.write(record.path, new TextEncoder().encode(record.content));
       }
     }
-    await this.options.store.confirmPublished(operation, this.syncedIndex(record, revision));
+    const outboxHasNewer = await this.options.store.confirmPublished(operation, this.syncedIndex(record, revision));
+    if (operation.operationId.startsWith("resolve-")) {
+      const conflictId = operation.operationId.slice("resolve-".length);
+      const conflict = await this.options.store.getConflict(conflictId);
+      if (!outboxHasNewer && conflict?.lifecycle === "pending-sync") {
+        await this.options.store.updateConflict(conflictId, { lifecycle: "resolved" });
+        await this.options.store.appendConflictHistory({ operationId: conflictId, event: "resolved", outcome: "sync-confirmed" });
+        await this.refreshConflicts();
+      }
+    }
   }
 
   private scheduleRetry(delay: number): void {
@@ -694,6 +935,7 @@ export class MarkdownSyncEngine {
   private async applyRemote(value: Uint8Array, revision: number): Promise<void> {
     let record: RemoteFileRecord;
     try { record = decodeRecord(value); } catch { this.conflict(); return; }
+    if (isConflictReviewPath(record.path)) return;
     const { store, vault } = this.options;
     const current = await store.getFile(record.fileId);
     if (current?.remoteRevision !== undefined && current.remoteRevision >= revision) return;
@@ -763,8 +1005,11 @@ export class MarkdownSyncEngine {
     const copyPath = this.collisionPath(record.path, loserId);
     const operationId = `path-${record.fileId < other.fileId ? record.fileId : other.fileId}-${loserId}`;
     await store.putConflict({ operationId, originalFileId: record.fileId, originalPath: record.path,
-      copyFileId: loserId, copyPath, remoteRevision: revision });
-    status.conflictPaths = (await store.conflicts()).map((item) => item.copyPath);
+      copyFileId: loserId, copyPath, remoteRevision: revision, lifecycle: "unresolved", context: "path-collision",
+      canonicalPath: record.path, remotePath: record.path, detectionRemoteHash: record.contentHash,
+      detectionLocalHash: other.localHash, detectionCopyHash: other.localHash, kind: record.kind, size: record.size });
+    await store.appendConflictHistory({ operationId, event: "detected", context: "path-collision", path: copyPath });
+    status.conflictPaths = (await store.unresolvedConflicts()).map((item) => item.copyPath);
     status.conflicts = status.conflictPaths.length; status.refresh();
     if (loserId === record.fileId) {
       for (let attempt = 0; attempt < 3; attempt++) {

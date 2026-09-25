@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
+import type { KV } from "@nats-io/kv";
+import type { NatsConnection } from "@nats-io/nats-core";
 import { SecretStorageDouble, NatsKvDouble } from "../doubles/index.js";
 import { indexedDBDouble } from "../doubles/index.js";
 import { LocalStore } from "../../packages/plugin/src/local-store.js";
-import { connectVault, SyncStatus, type VaultConnectionConfig } from "../../packages/plugin/src/connection.js";
+import { connectVault, NatsKvAdapter, SyncStatus, type VaultConnectionConfig } from "../../packages/plugin/src/connection.js";
 
 const config = (vaultId: string): VaultConnectionConfig => ({
   vaultId,
@@ -13,6 +15,29 @@ const config = (vaultId: string): VaultConnectionConfig => ({
 });
 
 describe("NATS connection", () => {
+  it("lists KV values with bounded concurrency and preserves key order", async () => {
+    const keys = Array.from({ length: 12 }, (_, index) => `f.${index}`);
+    let active = 0;
+    let peak = 0;
+    const kv = {
+      keys: async () => (async function* () { for (const key of keys) yield key; })(),
+      get: async (key: string) => {
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active--;
+        const index = Number(key.slice(2));
+        return index === 3 ? null : { value: new Uint8Array([index]), revision: index + 1 };
+      },
+    } as unknown as KV;
+    const adapter = new NatsKvAdapter(kv, {} as NatsConnection);
+
+    const listed = await adapter.list();
+
+    expect(listed.map((entry) => entry.key)).toEqual(keys.filter((key) => key !== "f.3"));
+    expect(peak).toBe(8);
+  });
+
   it("reads password from SecretStorage and opens only configured bucket", async () => {
     const secrets = new SecretStorageDouble();
     await secrets.setSecret("nats-A", "strong-a");

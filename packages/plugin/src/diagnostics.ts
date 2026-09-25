@@ -5,6 +5,10 @@ export interface PluginLogger {
   error(event: string, cause: unknown, fields?: LogFields): void;
 }
 
+function timestamp(): string {
+  return new Date().toISOString();
+}
+
 function redact(text: string): string {
   return text.replace(/\b(?:wss?|https?):\/\/[^\s"'<>]+/gi, (value) => {
     try {
@@ -34,10 +38,10 @@ export function createLogger(debugEnabled: () => boolean, sink: Pick<Console, "d
   redact: (message: string) => string = (message) => message): PluginLogger {
   return {
     debug(event, fields) {
-      if (debugEnabled()) sink.debug(`[flash-sync] ${event}`, fields ?? {});
+      if (debugEnabled()) sink.debug(`[flash-sync] ${timestamp()} ${event}`, fields ?? {});
     },
     error(event, cause, fields) {
-      sink.error(`[flash-sync] ${event}: ${redact(errorSummary(cause))}`, fields ?? {});
+      sink.error(`[flash-sync] ${timestamp()} ${event}: ${redact(errorSummary(cause))}`, fields ?? {});
     },
   };
 }

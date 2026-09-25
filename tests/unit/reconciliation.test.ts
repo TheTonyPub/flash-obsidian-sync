@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { encodeRecord, sha256Hex, type RemoteFileRecord } from "../../packages/protocol/src/index.js";
 import { SyncStatus, type KvPort } from "../../packages/plugin/src/connection.js";
 import { LocalStore } from "../../packages/plugin/src/local-store.js";
@@ -83,6 +83,55 @@ describe("reconciliation and durable replay", () => {
     release();
     await starting;
     expect(status.value).toBe("SYNCED");
+    engine.stop(); local.close();
+  });
+
+  it("coalesces a visibility-style reconcile request while startup reconciliation is running", async () => {
+    const kv = new NatsKvDouble();
+    const original = kv.list.bind(kv);
+    let calls = 0;
+    let release!: () => void;
+    let entered!: () => void;
+    const listing = new Promise<void>((resolve) => { entered = resolve; });
+    const delayed: KvPort = {
+      get: kv.get.bind(kv), put: kv.put.bind(kv), watch: kv.watch.bind(kv),
+      create: kv.create.bind(kv), update: kv.update.bind(kv),
+      list: async () => {
+        calls++;
+        await new Promise<void>((resolve) => { release = resolve; entered(); });
+        return original();
+      },
+    };
+    const local = await store();
+    const engine = new MarkdownSyncEngine({ deviceId: "device-a", kv: delayed, store: local, vault: new VaultDouble(), status: new SyncStatus() });
+
+    const starting = engine.start();
+    await listing;
+    const visibilityReconcile = engine.reconcile();
+    release();
+    await Promise.all([starting, visibilityReconcile]);
+
+    expect(calls).toBe(1);
+    engine.stop(); local.close();
+  });
+
+  it("records bounded stage timings and reconcile work counts", async () => {
+    const kv = new NatsKvDouble();
+    const local = await store();
+    const debug = vi.fn();
+    const engine = new MarkdownSyncEngine({
+      deviceId: "device-a", kv, store: local, vault: new VaultDouble(), status: new SyncStatus(),
+      logger: { debug, error: vi.fn() },
+    });
+
+    await engine.start();
+
+    const complete = debug.mock.calls.find(([event]) => event === "reconcile.complete")?.[1] as Record<string, number>;
+    expect(complete).toMatchObject({ pending: 0, conflicts: 0, remoteApplied: 0, localApplied: 0 });
+    for (const field of ["watchSetupMs", "localScanMs", "remoteListMs", "remoteApplyMs", "localApplyMs", "outboxReplayMs", "totalDurationMs"]) {
+      expect(complete[field]).toBeTypeOf("number");
+      expect(complete[field]).toBeGreaterThanOrEqual(0);
+    }
     engine.stop(); local.close();
   });
 

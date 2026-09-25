@@ -37,6 +37,27 @@ export interface ConflictRecord {
   copyFileId: string;
   copyPath: string;
   remoteRevision: number;
+  /** Fields added in v3 are optional so records written by older plugin versions remain readable. */
+  lifecycle?: "unresolved" | "pending-sync" | "resolved";
+  context?: "merge" | "path-collision" | "bootstrap";
+  canonicalPath?: string;
+  remotePath?: string;
+  detectionRemoteHash?: string;
+  detectionLocalHash?: string;
+  detectionCopyHash?: string;
+  kind?: "text" | "blob";
+  size?: number;
+  mime?: string;
+  recoveryBackup?: { path: string; hash: string; size: number };
+}
+
+export interface ConflictHistoryEntry {
+  operationId?: string;
+  event?: string;
+  outcome?: string;
+  context?: string;
+  createdAt: number;
+  [key: string]: string | number | boolean | undefined;
 }
 
 function request<T>(value: IDBRequest<T>): Promise<T> {
@@ -58,7 +79,7 @@ export class LocalStore {
   private constructor(private readonly database: IDBDatabase) {}
 
   static async open(name: string, factory: IDBFactory = indexedDB): Promise<LocalStore> {
-    const opening = factory.open(name, 2);
+    const opening = factory.open(name, 3);
     opening.onupgradeneeded = () => {
       const database = opening.result;
       if (!database.objectStoreNames.contains("files")) {
@@ -71,6 +92,9 @@ export class LocalStore {
       }
       if (!database.objectStoreNames.contains("conflicts")) {
         database.createObjectStore("conflicts", { keyPath: "operationId" });
+      }
+      if (!database.objectStoreNames.contains("conflict-history")) {
+        database.createObjectStore("conflict-history", { keyPath: "id", autoIncrement: true });
       }
     };
     return new LocalStore(await request(opening));
@@ -104,6 +128,10 @@ export class LocalStore {
     return request<ConflictRecord[]>(this.database.transaction("conflicts").objectStore("conflicts").getAll());
   }
 
+  async unresolvedConflicts(): Promise<ConflictRecord[]> {
+    return (await this.conflicts()).filter((entry) => entry.lifecycle !== "resolved");
+  }
+
   async getConflict(operationId: string): Promise<ConflictRecord | undefined> {
     return request<ConflictRecord | undefined>(this.database.transaction("conflicts").objectStore("conflicts").get(operationId));
   }
@@ -111,8 +139,56 @@ export class LocalStore {
   async putConflict(entry: ConflictRecord): Promise<void> {
     const transaction = this.database.transaction("conflicts", "readwrite");
     const done = complete(transaction);
-    transaction.objectStore("conflicts").put(entry);
+    const store = transaction.objectStore("conflicts");
+    const existing = await request<ConflictRecord | undefined>(store.get(entry.operationId));
+    // Creation can be retried after restart. A completed record is terminal unless an
+    // explicit lifecycle update is supplied by the resolution operation itself.
+    const lifecycle = entry.lifecycle ?? existing?.lifecycle ?? "unresolved";
+    store.put({ ...existing, ...entry, lifecycle });
     await done;
+  }
+
+  async updateConflict(operationId: string, update: Partial<ConflictRecord>): Promise<ConflictRecord> {
+    const transaction = this.database.transaction("conflicts", "readwrite");
+    const done = complete(transaction);
+    const store = transaction.objectStore("conflicts");
+    const current = await request<ConflictRecord | undefined>(store.get(operationId));
+    if (!current) throw new Error(`Unknown conflict: ${operationId}`);
+    const next = { ...current, ...update };
+    store.put(next);
+    await done;
+    return next;
+  }
+
+  async appendConflictHistory(input: Record<string, unknown>): Promise<void> {
+    const transaction = this.database.transaction("conflict-history", "readwrite");
+    const done = complete(transaction);
+    const store = transaction.objectStore("conflict-history");
+    // Keep an allow-list: history is operational metadata, never note or credential data.
+    const entry: ConflictHistoryEntry = { createdAt: Date.now() };
+    for (const key of ["operationId", "event", "outcome", "context", "path", "retryCount", "lifecycle"] as const) {
+      const value = input[key];
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        (entry as Record<string, string | number | boolean | undefined>)[key] = value;
+      }
+    }
+    store.add(entry);
+    const entries = await request<Array<ConflictHistoryEntry & { id: number }>>(store.getAll());
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const retained = entries.sort((a, b) => a.createdAt - b.createdAt || a.id - b.id)
+      .filter((entry, index, all) => entry.createdAt >= cutoff && index >= Math.max(0, all.length - 200));
+    const ids = new Set(retained.map((entry) => entry.id));
+    for (const entry of entries) if (!ids.has(entry.id)) store.delete(entry.id);
+    await done;
+  }
+
+  async conflictHistory(): Promise<ConflictHistoryEntry[]> {
+    const entries = await request<Array<ConflictHistoryEntry & { id: number }>>(this.database.transaction("conflict-history").objectStore("conflict-history").getAll());
+    return entries.sort((a, b) => a.createdAt - b.createdAt || a.id - b.id).map((item) => {
+      const { id, ...entry } = item;
+      void id;
+      return entry;
+    });
   }
 
   async pending(): Promise<OutboxOperation[]> {

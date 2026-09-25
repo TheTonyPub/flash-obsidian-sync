@@ -24,17 +24,17 @@ describe("plugin diagnostics", () => {
     logger.debug("nats.connect", { bucket: "OBS_A_FILES" });
     expect(sink.debug).not.toHaveBeenCalled();
     logger.error("nats.connect", new Error("Authorization Violation"), { bucket: "OBS_A_FILES" });
-    expect(sink.error).toHaveBeenCalledWith("[flash-sync] nats.connect: Authorization Violation", { bucket: "OBS_A_FILES" });
+    expect(sink.error).toHaveBeenCalledWith(expect.stringMatching(/^\[flash-sync\] \d{4}-\d{2}-\d{2}T.*Z nats\.connect: Authorization Violation$/), { bucket: "OBS_A_FILES" });
     debug = true;
     logger.debug("nats.connected", { bucket: "OBS_A_FILES" });
-    expect(sink.debug).toHaveBeenCalledWith("[flash-sync] nats.connected", { bucket: "OBS_A_FILES" });
+    expect(sink.debug).toHaveBeenCalledWith(expect.stringMatching(/^\[flash-sync\] \d{4}-\d{2}-\d{2}T.*Z nats\.connected$/), { bucket: "OBS_A_FILES" });
   });
 
   it("redacts active secret values from technical logs", () => {
     const sink = { debug: vi.fn(), error: vi.fn() };
     const logger = createLogger(() => false, sink, (message) => message.replaceAll("private-token", "[redacted]"));
     logger.error("connection.failed", new Error("Rejected private-token by server"));
-    expect(sink.error).toHaveBeenCalledWith("[flash-sync] connection.failed: Rejected [redacted] by server", {});
+    expect(sink.error).toHaveBeenCalledWith(expect.stringMatching(/^\[flash-sync\] \d{4}-\d{2}-\d{2}T.*Z connection\.failed: Rejected \[redacted\] by server$/), {});
   });
 
   it("keeps the root reconciliation failure visible in status and console", async () => {
@@ -92,7 +92,7 @@ describe("plugin diagnostics", () => {
     vault.write("note.md", new TextEncoder().encode("content"));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(status.lastError).toBe("read failed");
-    expect(sink.error).toHaveBeenCalledWith("[flash-sync] vault.read_failed: read failed", {});
+    expect(sink.error).toHaveBeenCalledWith(expect.stringMatching(/^\[flash-sync\] \d{4}-\d{2}-\d{2}T.*Z vault\.read_failed: read failed$/), {});
     engine.stop();
     store.close();
   });

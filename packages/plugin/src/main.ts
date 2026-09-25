@@ -1,16 +1,18 @@
 import { EditorView } from "@codemirror/view";
-import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian";
+import { App, MarkdownView, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, setIcon } from "obsidian";
 import QRCode from "qrcode";
 import { normalizePath } from "@flash-osidian-sync/protocol";
-import { connectExistingNatsBucket, connectVault, SyncStatus, statusSummary, type KvPort } from "./connection.js";
+import { connectExistingNatsBucket, connectVault, SyncStatus, type KvPort } from "./connection.js";
 import { LocalStore } from "./local-store.js";
 import { MarkdownSyncEngine, type MarkdownVault } from "./markdown-sync.js";
+import { CONFLICT_REVIEW_FOLDER, formatConflictReviewNote } from "./conflict-review-note.js";
 import { connectS3Blob, DEFAULT_INLINE_LIMIT, type BlobPort } from "./blob-storage.js";
 import { createLogger, errorSummary } from "./diagnostics.js";
 import { decryptTransfer, encryptTransfer, transferVersion, type TransferConfig } from "./config-transfer.js";
 import { PLUGIN_ID, registerImportUriHandlers } from "./plugin-identity.js";
 import { validateSettingsDraft, type SettingsField, type SettingsValidationErrors } from "./settings-validation.js";
-import type { ConflictRecord } from "./local-store.js";
+import type { ConflictHistoryEntry, ConflictRecord } from "./local-store.js";
+import { overviewStatusPresentation, statusPresentation } from "./status-presentation.js";
 
 interface EasySyncSettings {
   vaultId: string;
@@ -26,6 +28,7 @@ interface EasySyncSettings {
   s3SecretKeySecretKey: string;
   inlineLimit: number;
   debugLogging: boolean;
+  statusBarMode: "minimal" | "extended";
 }
 
 type SettingsSection = "overview" | "connection" | "attachments" | "device-transfer" | "advanced";
@@ -35,6 +38,12 @@ type SettingsApplyResult =
   | { kind: "validation-error"; errors: SettingsValidationErrors }
   | { kind: "persistence-error"; message: string }
   | { kind: "connection-error"; message: string };
+
+type ConflictComparison = {
+  remote: Record<string, unknown>;
+  local: Record<string, unknown>;
+  stale: { remote: boolean; local: boolean };
+};
 
 interface SettingsDraft extends EasySyncSettings {
   natsPassword: string;
@@ -64,6 +73,7 @@ function validateDraft(draft: SettingsDraft, passwordAvailable: boolean, s3Secre
 }
 
 function validIncluded(path: string): boolean {
+  if (path === CONFLICT_REVIEW_FOLDER || path.startsWith(`${CONFLICT_REVIEW_FOLDER}/`)) return false;
   try { return normalizePath(path) === path; }
   catch { return false; }
 }
@@ -155,6 +165,10 @@ export default class EasySyncPlugin extends Plugin {
   private settingsTab?: EasySyncSettingTab;
   readonly status = new SyncStatus();
   private operationQueue: Promise<void> = Promise.resolve();
+  private lastReconciledAt = 0;
+  private hiddenAt = 0;
+  private initialReconcileInFlight = false;
+  private static readonly desktopVisibilityReconcileAfterMs = 5 * 60 * 1000;
   private readonly logger = createLogger(() => this.config?.debugLogging ?? false, console,
     (message) => this.redactDiagnostic(message));
 
@@ -197,11 +211,31 @@ export default class EasySyncPlugin extends Plugin {
       s3SecretKeySecretKey: saved?.s3SecretKeySecretKey ?? "",
       inlineLimit: saved?.inlineLimit ?? DEFAULT_INLINE_LIMIT,
       debugLogging: saved?.debugLogging ?? false,
+      statusBarMode: saved?.statusBarMode ?? "extended",
     };
     await this.saveSettings();
     const statusBar = this.addStatusBarItem();
-    this.register(this.status.subscribe(() => statusBar.setText(`${PLUGIN_ID}: ${statusSummary(this.status)}`)));
-    statusBar.setText(`${PLUGIN_ID}: ${statusSummary(this.status)}`);
+    const renderStatusBar = (): void => {
+      const presentation = statusPresentation(this.status);
+      statusBar.empty();
+      statusBar.classList.remove("flash-sync-status-neutral", "flash-sync-status-success", "flash-sync-status-error", "flash-sync-status-muted", "flash-sync-status-warning");
+      statusBar.classList.add("flash-sync-status", `flash-sync-status-${presentation.color}`);
+      statusBar.style.color = { neutral: "var(--text-normal)", success: "var(--text-success)", error: "var(--text-error)",
+        muted: "var(--text-muted)", warning: "var(--text-warning)" }[presentation.color];
+      statusBar.setAttribute("aria-label", presentation.label);
+      statusBar.setAttribute("title", presentation.tooltip);
+      statusBar.setAttribute("role", "button");
+      statusBar.tabIndex = 0;
+      const icon = statusBar.createSpan({ cls: "flash-sync-status-icon", attr: { "aria-hidden": "true" } });
+      setIcon(icon, presentation.icon);
+      if (this.config.statusBarMode === "extended") statusBar.createSpan({ text: ` ${presentation.text}`, cls: "flash-sync-status-text" });
+    };
+    statusBar.addEventListener("click", () => this.openStatusOverview());
+    statusBar.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); this.openStatusOverview(); }
+    });
+    this.register(this.status.subscribe(renderStatusBar));
+    renderStatusBar();
     this.settingsTab = new EasySyncSettingTab(this.app, this);
     this.addSettingTab(this.settingsTab);
     registerImportUriHandlers(((scheme, handler) => {
@@ -216,7 +250,13 @@ export default class EasySyncPlugin extends Plugin {
     }));
     this.app.workspace.onLayoutReady(() => { void this.connectNow(); });
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (!document.hidden) this.reconcileAfter("visibilitychange");
+      if (document.hidden) {
+        this.hiddenAt = Date.now();
+      } else if (this.shouldReconcileOnVisibility()) {
+        this.reconcileAfter("visibilitychange");
+      } else {
+        this.logger.debug("reconcile.visibility_skipped", { connected: this.status.connected, reconciled: this.status.reconciled });
+      }
     });
     this.registerDomEvent(window, "online", () => { this.reconcileAfter("online"); });
   }
@@ -227,6 +267,12 @@ export default class EasySyncPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.config);
+  }
+
+  private openStatusOverview(): void {
+    const setting = (this.app as App & { setting?: { open: () => void; openTabById: (id: string) => void } }).setting;
+    setting?.open();
+    setting?.openTabById(PLUGIN_ID);
   }
 
   async exportConfig(phrase: string): Promise<string> {
@@ -258,9 +304,11 @@ export default class EasySyncPlugin extends Plugin {
     return this.applyDraft(draft, "all");
   }
 
-  async applyDraft(draft: SettingsDraft, section: SettingsSection | "all"): Promise<SettingsApplyResult> {
-    const submittedDraft = { ...draft };
+  async applyDraft(draft: SettingsDraft | ((settings: EasySyncSettings) => SettingsDraft), section: SettingsSection | "all"): Promise<SettingsApplyResult> {
+    const submittedSnapshot = typeof draft === "function" ? undefined : { ...draft };
+    const draftFactory = typeof draft === "function" ? draft : undefined;
     return this.serialize(async () => {
+      const submittedDraft = submittedSnapshot ?? draftFactory!(this.config);
       if (this.config.boundVaultId && this.config.boundVaultId !== submittedDraft.vaultId) {
         return { kind: "validation-error", errors: { vaultId: "This device is bound to a different vault." } };
       }
@@ -274,7 +322,8 @@ export default class EasySyncPlugin extends Plugin {
       if (attachmentFields) Object.assign(candidate, { s3Endpoint: submittedDraft.s3Endpoint, s3Bucket: submittedDraft.s3Bucket,
         s3Region: submittedDraft.s3Region, s3AccessKeyId: submittedDraft.s3AccessKeyId, s3Secret: submittedDraft.s3Secret,
         attachmentsEnabled: submittedDraft.attachmentsEnabled });
-      if (advancedFields) Object.assign(candidate, { inlineLimit: submittedDraft.inlineLimit, debugLogging: submittedDraft.debugLogging });
+      if (advancedFields) Object.assign(candidate, { inlineLimit: submittedDraft.inlineLimit, debugLogging: submittedDraft.debugLogging,
+        statusBarMode: submittedDraft.statusBarMode });
       const passwordAvailable = Boolean(candidate.natsPassword || (candidate.passwordSecretKey &&
         this.app.secretStorage.getSecret(candidate.passwordSecretKey)));
       const s3SecretAvailable = Boolean(candidate.s3Secret || (candidate.s3SecretKeySecretKey &&
@@ -297,7 +346,8 @@ export default class EasySyncPlugin extends Plugin {
         username: candidate.username });
       if (attachmentFields) Object.assign(next, { s3Endpoint: candidate.s3Endpoint, s3Bucket: candidate.s3Bucket,
         s3Region: candidate.s3Region, s3AccessKeyId: candidate.s3AccessKeyId });
-      if (advancedFields) Object.assign(next, { inlineLimit: candidate.inlineLimit, debugLogging: candidate.debugLogging });
+      if (advancedFields) Object.assign(next, { inlineLimit: candidate.inlineLimit, debugLogging: candidate.debugLogging,
+        statusBarMode: candidate.statusBarMode });
       try {
         if (connectionFields && candidate.natsPassword) {
           next.passwordSecretKey = `${PLUGIN_ID}-nats-${crypto.randomUUID()}`;
@@ -317,6 +367,7 @@ export default class EasySyncPlugin extends Plugin {
       }
       this.config = next;
       this.settingsTab?.onApplied(next, section);
+      if (previous.statusBarMode !== next.statusBarMode) this.status.refresh();
 
       const reconnectFields: Array<keyof EasySyncSettings> = ["vaultId", "server", "username", "passwordSecretKey",
         "s3Endpoint", "s3Bucket", "s3Region", "s3AccessKeyId", "s3SecretKeySecretKey", "inlineLimit"];
@@ -342,17 +393,35 @@ export default class EasySyncPlugin extends Plugin {
     });
   }
 
+  async applyAdvancedUpdate(update: Partial<Pick<EasySyncSettings, "inlineLimit" | "debugLogging" | "statusBarMode">>): Promise<SettingsApplyResult> {
+    return this.applyDraft((settings) => ({ ...draftFor(settings), ...update }), "advanced");
+  }
+
   private reconcileAfter(trigger: string): void {
     if (!this.engine) return;
     this.logger.debug("reconcile.trigger", { trigger });
-    void this.engine.reconcile().catch((error: unknown) => {
+    const startedAt = performance.now();
+    void this.engine.reconcile().then(() => {
+      this.lastReconciledAt = Date.now();
+      this.logger.debug("reconcile.trigger_complete", { trigger, durationMs: Math.round(performance.now() - startedAt) });
+    }).catch((error: unknown) => {
       this.status.lastError = errorSummary(error);
       this.status.refresh();
       this.logger.error("reconcile.trigger_failed", error, { trigger });
     });
   }
 
+  private shouldReconcileOnVisibility(): boolean {
+    if (Platform.isMobile) return true;
+    if (this.initialReconcileInFlight) return false;
+    if (!this.engine || !this.status.connected || !this.status.reconciled) return true;
+    const hiddenForMs = this.hiddenAt ? Date.now() - this.hiddenAt : 0;
+    return hiddenForMs >= EasySyncPlugin.desktopVisibilityReconcileAfterMs ||
+      Date.now() - this.lastReconciledAt >= EasySyncPlugin.desktopVisibilityReconcileAfterMs;
+  }
+
   private async disconnect(): Promise<void> {
+    this.initialReconcileInFlight = false;
     this.engine?.stop();
     await this.engine?.settle();
     this.engine = undefined;
@@ -368,6 +437,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private async connectNowUnlocked(): Promise<SettingsApplyResult> {
+    const startedAt = performance.now();
     const config = this.config;
     const draft = draftFor(config);
     const validation = validateDraft(draft, Boolean(config.passwordSecretKey && this.app.secretStorage.getSecret(config.passwordSecretKey)),
@@ -400,7 +470,7 @@ export default class EasySyncPlugin extends Plugin {
     this.status.refresh();
     await this.disconnect();
     this.status.lastError = "";
-    this.logger.debug("plugin.connect", { vaultId: config.vaultId, bucket: `OBS_${config.vaultId}_FILES` });
+    this.logger.debug("plugin.connect.start", { vaultId: config.vaultId, bucket: `OBS_${config.vaultId}_FILES` });
     if (config.boundVaultId && config.boundVaultId !== config.vaultId) {
       new Notice(`${PLUGIN_ID}: vault binding cannot be changed`);
       return { kind: "validation-error", errors: { vaultId: "This device is bound to a different vault." } };
@@ -411,8 +481,11 @@ export default class EasySyncPlugin extends Plugin {
         username: config.username, passwordSecretKey: config.passwordSecretKey,
       }, { getSecret: async (key) => this.app.secretStorage.getSecret(key) },
       (options, bucket, status) => connectExistingNatsBucket(options, bucket, status, this.logger), this.status);
+      this.logger.debug("plugin.connect.wss_complete", { durationMs: Math.round(performance.now() - startedAt) });
       this.kv = kv;
+      const storeStartedAt = performance.now();
       const store = await LocalStore.open(`${PLUGIN_ID}-${config.deviceId}-${config.vaultId}`);
+      this.logger.debug("plugin.connect.store_open_complete", { durationMs: Math.round(performance.now() - storeStartedAt) });
       this.store = store;
       if (validation.attachmentsConfigured) {
         try {
@@ -435,7 +508,17 @@ export default class EasySyncPlugin extends Plugin {
         vault: new ObsidianMarkdownVault(this.app), store, kv, blob: this.blob,
         inlineLimit: config.inlineLimit, status: this.status, logger: this.logger });
       this.engine = engine;
-      await engine.start();
+      const reconcileStartedAt = performance.now();
+      this.initialReconcileInFlight = true;
+      try {
+        await engine.start();
+      } finally {
+        this.initialReconcileInFlight = false;
+      }
+      this.lastReconciledAt = Date.now();
+      this.logger.debug("plugin.connect.first_reconcile_complete", {
+        durationMs: Math.round(performance.now() - reconcileStartedAt), totalDurationMs: Math.round(performance.now() - startedAt),
+      });
       if (!config.boundVaultId) {
         config.boundVaultId = config.vaultId;
         await this.saveSettings();
@@ -449,13 +532,54 @@ export default class EasySyncPlugin extends Plugin {
       this.status.connectionError = message;
       this.status.connectionState = this.status.value === "AUTH_ERROR" ? "AUTH_ERROR" : "OFFLINE";
       this.status.refresh();
-      this.logger.error("plugin.connect_failed", error, { vaultId: config.vaultId, bucket: `OBS_${config.vaultId}_FILES` });
+      this.logger.error("plugin.connect_failed", error, { vaultId: config.vaultId, bucket: `OBS_${config.vaultId}_FILES`,
+        durationMs: Math.round(performance.now() - startedAt) });
       return { kind: "connection-error", message };
     }
   }
 
   async getConflicts(): Promise<ConflictRecord[]> {
-    return this.store ? this.store.conflicts() : [];
+    return this.store ? this.store.unresolvedConflicts() : [];
+  }
+
+  async getConflictHistory(): Promise<ConflictHistoryEntry[]> {
+    return this.store ? this.store.conflictHistory() : [];
+  }
+
+  async compareConflict(operationId: string): Promise<ConflictComparison> {
+    if (!this.engine) throw new Error("Conflict review is unavailable until sync starts");
+    return this.engine.compareConflict(operationId);
+  }
+
+  async createConflictReview(operationId: string): Promise<string> {
+    const conflict = (await this.getConflicts()).find((item) => item.operationId === operationId);
+    if (!conflict) throw new Error("Conflict is no longer available for review");
+    const comparison = await this.compareConflict(operationId);
+    const timestamp = new Date().toISOString().replaceAll(":", "-").replace(/\.\d{3}Z$/, "Z");
+    const name = (conflict.originalPath.split("/").at(-1)?.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 80)) || "conflict";
+    const path = `${CONFLICT_REVIEW_FOLDER}/${name}-${timestamp}-${crypto.randomUUID()}.md`;
+    if (!this.app.vault.getAbstractFileByPath(CONFLICT_REVIEW_FOLDER)) await this.app.vault.createFolder(CONFLICT_REVIEW_FOLDER);
+    await this.app.vault.create(path, formatConflictReviewNote({
+      originalPath: conflict.originalPath, copyPath: conflict.copyPath, remoteRevision: conflict.remoteRevision,
+      detectionRemoteHash: conflict.detectionRemoteHash, detectionCopyHash: conflict.detectionCopyHash, comparison,
+    }));
+    await this.app.workspace.openLinkText(path, "", false);
+    return path;
+  }
+
+  async keepRemote(operationId: string): Promise<void> {
+    if (!this.engine) throw new Error("Conflict resolution is unavailable until sync starts");
+    await this.engine.keepRemote(operationId);
+  }
+
+  async keepLocalCopy(operationId: string): Promise<void> {
+    if (!this.engine) throw new Error("Conflict resolution is unavailable until sync starts");
+    await this.engine.keepLocalCopy(operationId);
+  }
+
+  async markConflictResolved(operationId: string): Promise<void> {
+    if (!this.engine) throw new Error("Conflict resolution is unavailable until sync starts");
+    await this.engine.markResolved(operationId);
   }
 }
 
@@ -614,12 +738,29 @@ class DraftSwitchModal extends Modal {
   private finish(choice: "apply" | "discard" | "keep"): void { this.resolveChoice(choice); this.close(); }
 }
 
+class ConfirmConflictActionModal extends Modal {
+  constructor(app: App, private readonly action: string, private readonly onConfirm: () => Promise<void>) { super(app); }
+
+  onOpen(): void {
+    this.contentEl.empty();
+    this.contentEl.createEl("h2", { text: this.action });
+    this.contentEl.createEl("p", { text: "This applies only to the selected conflict after live versions are checked again." });
+    const result = this.contentEl.createDiv();
+    new Setting(this.contentEl).addButton((button) => button.setButtonText("Confirm").setCta().onClick(async () => {
+      try { await this.onConfirm(); this.close(); }
+      catch (error) { result.empty(); result.createEl("p", { text: error instanceof Error ? error.message : String(error) }); }
+    }));
+    new Setting(this.contentEl).addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()));
+  }
+}
+
 class EasySyncSettingTab extends PluginSettingTab {
   private unsubscribe?: () => void;
   private drafts = new Map<SettingsSection, SettingsDraft>();
   private activeSection: SettingsSection = "overview";
   private panel?: HTMLElement;
   private summary?: HTMLElement;
+  private overviewStatus?: HTMLElement;
   private conflictRegion?: HTMLElement;
   private overviewActions?: HTMLElement;
   private attachmentSettingsAction?: HTMLButtonElement;
@@ -627,6 +768,7 @@ class EasySyncSettingTab extends PluginSettingTab {
   private transferMode: "import" | "export" = "import";
   private busy = false;
   private navigationDecisionPending = false;
+  private lastInlineLimitCommit?: string;
 
   constructor(app: App, private readonly plugin: EasySyncPlugin) { super(app, plugin); }
 
@@ -707,7 +849,7 @@ class EasySyncSettingTab extends PluginSettingTab {
     const fields: Record<SettingsSection, Array<keyof SettingsDraft>> = {
       overview: [], connection: ["vaultId", "server", "username", "passwordSecretKey", "natsPassword"],
       attachments: ["s3Endpoint", "s3Bucket", "s3Region", "s3AccessKeyId", "s3SecretKeySecretKey", "s3Secret"],
-      "device-transfer": [], advanced: ["inlineLimit", "debugLogging"],
+      "device-transfer": [], advanced: ["inlineLimit", "debugLogging", "statusBarMode"],
     };
     if (section === "attachments" && draft.attachmentsEnabled !== Boolean(this.plugin.config.s3Endpoint || this.plugin.config.s3Bucket ||
       this.plugin.config.s3AccessKeyId || this.plugin.config.s3SecretKeySecretKey ||
@@ -737,6 +879,7 @@ class EasySyncSettingTab extends PluginSettingTab {
   }
 
   private updateSummary(): void {
+    this.updateOverviewStatus();
     if (!this.summary) return;
     this.summary.empty();
     const status = this.plugin.status;
@@ -782,12 +925,24 @@ class EasySyncSettingTab extends PluginSettingTab {
     }
   }
 
+  private updateOverviewStatus(): void {
+    if (!this.overviewStatus || this.activeSection !== "overview") return;
+    const presentation = overviewStatusPresentation(this.plugin.status);
+    this.overviewStatus.empty();
+    this.overviewStatus.classList.remove("flash-sync-status-dot-green", "flash-sync-status-dot-yellow", "flash-sync-status-dot-red", "flash-sync-status-dot-gray");
+    this.overviewStatus.classList.add(`flash-sync-status-dot-${presentation.color}`);
+    this.overviewStatus.setAttribute("aria-label", `Sync status: ${presentation.label}`);
+    this.overviewStatus.createSpan({ cls: "flash-sync-status-dot", attr: { "aria-hidden": "true" } });
+    this.overviewStatus.createSpan({ text: presentation.label });
+  }
+
   private renderSection(): void {
     const panel = this.panel;
     if (!panel) return;
     panel.empty();
     panel.id = `flash-sync-panel-${this.activeSection}`;
     this.summary = undefined;
+    this.overviewStatus = undefined;
     this.overviewActions = undefined;
     this.attachmentSettingsAction = undefined;
     this.fieldRows.clear();
@@ -804,6 +959,8 @@ class EasySyncSettingTab extends PluginSettingTab {
 
   private renderOverview(panel: HTMLElement): void {
     panel.createEl("h2", { text: "Sync overview" });
+    this.overviewStatus = panel.createDiv({ cls: "flash-sync-overview-indicator", attr: { role: "status", "aria-live": "polite" } });
+    this.updateOverviewStatus();
     this.summary = panel.createDiv({ cls: "flash-sync-overview-status" });
     this.updateSummary();
     const actions = panel.createDiv({ cls: "flash-sync-actions" });
@@ -855,20 +1012,46 @@ class EasySyncSettingTab extends PluginSettingTab {
     if (region !== this.conflictRegion || this.activeSection !== "overview") return;
     region.empty();
     region.createEl("h3", { text: `Conflicts (${conflicts.length})` });
+    if (!conflicts.length) region.createEl("p", { text: "No unresolved conflicts." });
     for (const conflict of conflicts) {
       const name = conflict.originalPath.split("/").at(-1) || conflict.originalPath;
-      const row = new Setting(region).setName(name)
-        .setDesc("Both copies are preserved. Resolve is coming later; merge or rename them manually.");
-      row.addButton((button) => button.setButtonText("Open copy").onClick(async () => {
+      const item = region.createEl("details", { cls: "flash-sync-conflict-item" });
+      const status = conflict.lifecycle === "pending-sync" ? "Waiting for sync" : "Needs review";
+      item.createEl("summary", { text: `${name} · ${status}` });
+      const body = item.createDiv({ cls: "flash-sync-conflict-body" });
+      body.createEl("p", { text: `Original: ${conflict.originalPath}`, cls: "flash-sync-conflict-path" });
+      body.createEl("p", { text: `Preserved copy: ${conflict.copyPath}`, cls: "flash-sync-conflict-path" });
+      body.createEl("p", { text: conflict.lifecycle === "pending-sync"
+        ? "Waiting for the selected change to synchronize." : "Review the separate comparison note before choosing." });
+      const actions = body.createDiv({ cls: "flash-sync-conflict-actions" });
+      new Setting(actions).addButton((button) => button.setButtonText("Open copy").onClick(async () => {
         await this.app.workspace.openLinkText(conflict.copyPath, "", false);
       }));
-      row.addButton((button) => button.setButtonText("Resolve").setDisabled(true));
-      const paths = region.createEl("details");
-      paths.createEl("summary", { text: "Show full paths" });
-      paths.createEl("p", { text: `Original: ${conflict.originalPath}` });
-      paths.createEl("p", { text: `Copy: ${conflict.copyPath}` });
-      paths.createEl("p", { text: "Resolve is coming later." });
+      new Setting(actions).addButton((button) => button.setButtonText("Review comparison").onClick(async () => {
+        try { await this.plugin.createConflictReview(conflict.operationId); }
+        catch (error) { new Notice(`Unable to create conflict review: ${this.plugin.safeDiagnostic(error)}`); }
+      }));
+      if (conflict.lifecycle !== "pending-sync") {
+        new Setting(actions).addButton((button) => button.setButtonText("Keep remote").setCta().onClick(() => {
+          this.confirmConflictAction("Keep remote", () => this.plugin.keepRemote(conflict.operationId));
+        }));
+        new Setting(actions).addButton((button) => button.setButtonText("Keep local copy").onClick(() => {
+          this.confirmConflictAction("Keep local copy", () => this.plugin.keepLocalCopy(conflict.operationId));
+        }));
+        new Setting(actions).addButton((button) => button.setButtonText("Mark resolved after manual edit or delete").onClick(() => {
+          this.confirmConflictAction("Mark resolved", () => this.plugin.markConflictResolved(conflict.operationId));
+        }));
+      }
     }
+    const history = await this.plugin.getConflictHistory();
+    if (region !== this.conflictRegion || this.activeSection !== "overview") return;
+    const historyRegion = region.createEl("details", { cls: "flash-sync-conflict-history" });
+    historyRegion.createEl("summary", { text: "Conflict history" });
+    for (const event of history) historyRegion.createEl("p", { text: `${event.event ?? "event"}: ${event.outcome ?? event.context ?? "recorded"}` });
+  }
+
+  private confirmConflictAction(action: string, operation: () => Promise<void>): void {
+    new ConfirmConflictActionModal(this.app, action, async () => { await operation(); await this.renderConflicts(); }).open();
   }
 
   private addText(panel: HTMLElement, field: SettingsField, name: string, help: string, value: string,
@@ -1010,19 +1193,52 @@ class EasySyncSettingTab extends PluginSettingTab {
     }
   }
 
+  private async saveAdvanced(update: Partial<Pick<EasySyncSettings, "inlineLimit" | "debugLogging" | "statusBarMode">>, row?: Setting, help?: string): Promise<SettingsApplyResult> {
+    const outcome = await this.plugin.applyAdvancedUpdate(update);
+    if (outcome.kind === "validation-error") {
+      const message = outcome.errors.inlineLimitKiB;
+      if (message && row) row.setDesc(message);
+      return outcome;
+    }
+    if (row && help) row.setDesc(help);
+    if (outcome.kind === "persistence-error") {
+      new Notice(`Could not save settings: ${outcome.message}`);
+      this.renderSection();
+    }
+    return outcome;
+  }
+
   private renderAdvanced(panel: HTMLElement): void {
     panel.createEl("h2", { text: "Advanced" });
-    const draft = this.currentDraft();
     const row = new Setting(panel).setName("Inline Markdown limit (KiB)")
       .setDesc("Values above this size use S3. Changing this value reconnects sync.");
-    row.addText((text) => text.setValue(String(draft.inlineLimit / 1024)).onChange((value) => {
-      draft.inlineLimit = Number(value) * 1024;
-      this.clearFieldError("inlineLimitKiB");
+    const inlineLimit = row.controlEl.createEl("input", { attr: { type: "number", min: "1", step: "1", "aria-label": "Inline Markdown limit in KiB" } });
+    inlineLimit.value = String(this.plugin.config.inlineLimit / 1024);
+    const commitInlineLimit = (): void => {
+      const value = inlineLimit.value.trim();
+      if (value === this.lastInlineLimitCommit) return;
+      this.lastInlineLimitCommit = value;
+      void this.saveAdvanced({ inlineLimit: Number(value) * 1024 }, row, "Values above this size use S3. Changing this value reconnects sync.")
+        .then((outcome) => { if ((outcome.kind === "validation-error" || outcome.kind === "persistence-error") && this.lastInlineLimitCommit === value) this.lastInlineLimitCommit = undefined; });
+    };
+    inlineLimit.addEventListener("change", commitInlineLimit);
+    inlineLimit.addEventListener("blur", commitInlineLimit);
+    const statusBarRow = new Setting(panel).setName("Status bar presentation")
+      .setDesc("Minimal shows an icon; Extended shows an icon and text.");
+    const modes = statusBarRow.controlEl.createDiv({ cls: "flash-sync-status-mode-options", attr: { role: "radiogroup", "aria-label": "Status bar presentation" } });
+    for (const mode of ["minimal", "extended"] as const) {
+      const option = modes.createEl("label");
+      const input = option.createEl("input", { attr: { type: "radio", name: "flash-sync-status-mode", value: mode } });
+      input.checked = this.plugin.config.statusBarMode === mode;
+      input.addEventListener("change", () => { if (input.checked) void this.saveAdvanced({ statusBarMode: mode }); });
+      option.createSpan({ text: mode === "minimal" ? "Minimal" : "Extended" });
+    }
+    const diagnostics = panel.createDiv({ cls: "flash-sync-advanced-footer" });
+    diagnostics.createEl("h3", { text: "Diagnostics" });
+    const debugRow = new Setting(diagnostics).setName("Debug logging")
+      .setDesc("Write connection, reconciliation, and pending-change events to the developer console. Errors are always recorded.");
+    debugRow.addToggle((toggle) => toggle.setValue(this.plugin.config.debugLogging).onChange((value) => {
+      void this.saveAdvanced({ debugLogging: value });
     }));
-    this.fieldRows.set("inlineLimitKiB", { input: row.controlEl.querySelector("input")!, row, help: "Values above this size use S3. Changing this value reconnects sync." });
-    new Setting(panel).setName("Debug logging")
-      .setDesc("Write connection, reconciliation, and pending-change events to the developer console. Errors are always recorded.")
-      .addToggle((toggle) => toggle.setValue(draft.debugLogging).onChange((value) => { draft.debugLogging = value; }));
-    this.addDraftActions(panel);
   }
 }

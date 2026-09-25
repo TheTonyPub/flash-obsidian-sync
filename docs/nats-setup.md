@@ -80,6 +80,10 @@ The URI and QR contain a vault password. An empty optional phrase creates plaint
 
 S3 is optional. Leave all S3 fields empty to synchronize Markdown and content that fits the inline limit through NATS only. In that mode, images and other larger files are not synchronized. To synchronize large files, provide all S3 settings: HTTPS endpoint, bucket, region, access key ID, and secret key.
 
+Because the plugin currently sends S3 requests from Obsidian's browser context, the bucket must allow CORS for the Obsidian origin. In the provider's bucket CORS settings (for Timeweb Cloud, **S3 storage → bucket → Settings → CORS**), add a rule allowing origin `app://obsidian.md`, methods `PUT` and `GET`, and headers `*`. Preserve any existing CORS rules when updating the bucket configuration. See [Timeweb Cloud's CORS setup guide](https://timeweb.cloud/docs/s3-storage/supported-features/cors-setup) or the equivalent guide for your S3 provider.
+
+Without this rule, the browser blocks S3 uploads or downloads during the CORS preflight. `no-cors` is not a workaround: it cannot be used for these signed `PUT` requests or expose the response the plugin needs. A future transport based on Obsidian's native request API could avoid bucket CORS, but requires a separate plugin code change and validation.
+
 ## Verification and safe recovery
 
 Test a vault user's `put`, `get`, `watch`, `create`, `update`, and `status` operations only in that vault's bucket. Verify that the same user cannot access another vault's bucket and that invalid credentials are rejected. Check the plugin status after **Connect**; `SYNCED` indicates the initial reconciliation completed.

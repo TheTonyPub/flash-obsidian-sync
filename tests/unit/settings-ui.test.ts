@@ -9,6 +9,7 @@ const ui = vi.hoisted(() => {
   }
   const notices: string[] = [];
   const modals: FakeModal[] = [];
+  const setIcon = vi.fn();
   let focused: FakeElement | undefined;
   const recordFocus = (element: FakeElement): void => { focused = element; };
 
@@ -16,7 +17,9 @@ const ui = vi.hoisted(() => {
     readonly children: FakeElement[] = [];
     readonly attributes = new Map<string, string>();
     readonly listeners = new Map<string, Array<(event: Record<string, unknown>) => void>>();
-    readonly classList = { add: (...names: string[]) => { this.classes.push(...names); } };
+    readonly classList = { add: (...names: string[]) => { this.classes.push(...names); }, remove: (...names: string[]) => {
+      for (const name of names) { const index = this.classes.indexOf(name); if (index >= 0) this.classes.splice(index, 1); }
+    } };
     readonly classes: string[] = [];
     parentElement?: FakeElement;
     name = "";
@@ -28,6 +31,7 @@ const ui = vi.hoisted(() => {
     hidden = false;
     inert = false;
     tabIndex = 0;
+    readonly style = { color: "" };
     id = "";
     private ownText = "";
 
@@ -89,7 +93,8 @@ const ui = vi.hoisted(() => {
     constructor(readonly app: FakeApp) {}
     async loadData(): Promise<unknown> { return this.savedData; }
     async saveData(data: unknown): Promise<void> { this.savedData = data; }
-    addStatusBarItem(): { setText: (_text: string) => void } { return { setText: () => {} }; }
+    readonly statusItems: FakeElement[] = [];
+    addStatusBarItem(): FakeElement { const item = new FakeElement("div"); this.statusItems.push(item); return item; }
     addSettingTab(tab: FakePluginSettingTab): void { this.settingTabs.push(tab); }
     register(): void {}
     registerObsidianProtocolHandler(): void {}
@@ -145,7 +150,8 @@ const ui = vi.hoisted(() => {
     addToggle(callback: (component: { setValue: (value: boolean) => unknown; onChange: (fn: (value: boolean) => void) => unknown }) => unknown): this {
       const input = this.controlEl.createEl("input", { attr: { type: "checkbox" } });
       let change: ((value: boolean) => void) | undefined;
-      callback({ setValue: (value) => { input.checked = value; return this; }, onChange: (fn) => { change = fn; return this; } });
+      const toggle = { setValue: (value: boolean) => { input.checked = value; return toggle; }, onChange: (fn: (value: boolean) => void) => { change = fn; return toggle; } };
+      callback(toggle);
       input.addEventListener("change", () => change?.(input.checked));
       return this;
     }
@@ -153,14 +159,14 @@ const ui = vi.hoisted(() => {
 
   class FakeNotice { constructor(message: string) { notices.push(message); } }
 
-  return { FakeElement, FakePlugin, FakePluginSettingTab, FakeModal, FakeSetting, FakeNotice, notices, modals,
-    getFocused: () => focused, reset: () => { notices.length = 0; modals.length = 0; focused = undefined; } };
+  return { FakeElement, FakePlugin, FakePluginSettingTab, FakeModal, FakeSetting, FakeNotice, notices, modals, setIcon,
+    getFocused: () => focused, reset: () => { notices.length = 0; modals.length = 0; setIcon.mockClear(); focused = undefined; } };
 });
 
 vi.mock("obsidian", async (importOriginal) => {
   const actual = await importOriginal<typeof import("obsidian")>();
   return { ...actual, Plugin: ui.FakePlugin, PluginSettingTab: ui.FakePluginSettingTab, Modal: ui.FakeModal,
-    Setting: ui.FakeSetting, Notice: ui.FakeNotice };
+    Setting: ui.FakeSetting, Notice: ui.FakeNotice, setIcon: ui.setIcon };
 });
 
 const connectVault = vi.hoisted(() => vi.fn(async () => { throw new Error("offline"); }));
@@ -191,6 +197,18 @@ function findSettingInput(root: InstanceType<typeof ui.FakeElement>, name: strin
   return input;
 }
 
+function findSetting(root: InstanceType<typeof ui.FakeElement>, name: string): InstanceType<typeof ui.FakeElement> {
+  const rows = root.children.flatMap(function visit(element): InstanceType<typeof ui.FakeElement>[] {
+    return [element, ...element.children.flatMap(visit)];
+  }).filter((element) => element.getAttribute("data-setting-name") === name);
+  if (!rows[0]) throw new Error(`No setting: ${name}`);
+  return rows[0];
+}
+
+function descendants(root: InstanceType<typeof ui.FakeElement>): InstanceType<typeof ui.FakeElement>[] {
+  return root.children.flatMap((child) => [child, ...descendants(child)]);
+}
+
 function findButton(root: InstanceType<typeof ui.FakeElement>, text: string): InstanceType<typeof ui.FakeElement> {
   const button = root.children.flatMap(function visit(element): InstanceType<typeof ui.FakeElement>[] {
     return [element, ...element.children.flatMap(visit)];
@@ -201,16 +219,26 @@ function findButton(root: InstanceType<typeof ui.FakeElement>, text: string): In
 
 async function createPlugin() {
   const secrets = new Map<string, string>();
+  const vaultEntries = new Map<string, string>();
   const app = {
     secretStorage: { getSecret: (key: string) => secrets.get(key) ?? null, setSecret: (key: string, value: string) => secrets.set(key, value) },
-    workspace: { onLayoutReady: () => {}, getActiveViewOfType: () => null },
-    vault: { adapter: { exists: async () => false, read: async () => "" }, configDir: ".obsidian" },
+    setting: { open: vi.fn(), openTabById: vi.fn() },
+    workspace: { onLayoutReady: () => {}, getActiveViewOfType: () => null, openLinkText: vi.fn() },
+    vault: {
+      adapter: { exists: async () => false, read: async () => "" }, configDir: ".obsidian",
+      getAbstractFileByPath: (path: string) => vaultEntries.has(path) ? {} : undefined,
+      createFolder: vi.fn(async (path: string) => { vaultEntries.set(path, ""); }),
+      create: vi.fn(async (path: string, content: string) => {
+        if (vaultEntries.has(path)) throw new Error("already exists");
+        vaultEntries.set(path, content);
+      }),
+    },
   };
   const plugin = new EasySyncPlugin(app as never, {} as never);
   await plugin.onload();
   const tab = (plugin as unknown as { settingTabs: Array<{ display: () => void; hide: () => void; containerEl: InstanceType<typeof ui.FakeElement> }> }).settingTabs[0];
   tab.display();
-  return { plugin, tab, app, secrets };
+  return { plugin, tab, app, secrets, vaultEntries };
 }
 
 afterEach(() => {
@@ -220,6 +248,122 @@ afterEach(() => {
 });
 
 describe("settings UI interactions", () => {
+  it("keeps the status bar mode label, description, and dropdown in one setting row", async () => {
+    vi.stubGlobal("document", { hidden: false });
+    vi.stubGlobal("window", {});
+    const { plugin, tab } = await createPlugin();
+    tab.containerEl.querySelectorAll('button[role="tab"]')[4].click();
+    const panel = tab.containerEl.querySelector("[role=tabpanel]")!;
+    const row = findSetting(panel, "Status bar presentation");
+    const extended = descendants(row).find((element) => element.tagName === "input" && element.getAttribute("type") === "radio" && element.getAttribute("value") === "extended");
+    const debug = findSetting(panel, "Debug logging");
+
+    expect(row.textContent).toContain("Minimal shows an icon; Extended shows an icon and text.");
+    expect(extended?.checked).toBe(true);
+    expect(descendants(row).find((element) => element.getAttribute("role") === "radiogroup")).toBeDefined();
+    expect(debug.parentElement?.classes).toContain("flash-sync-advanced-footer");
+    expect(panel.textContent).not.toContain("Save changes");
+    expect(panel.textContent).not.toContain("Discard");
+
+    const minimal = descendants(row).find((element) => element.tagName === "input" && element.getAttribute("value") === "minimal")!;
+    minimal.checked = true;
+    minimal.dispatch("change");
+    await vi.waitFor(() => expect(plugin.config.statusBarMode).toBe("minimal"));
+
+    const updatedDebug = descendants(findSetting(tab.containerEl.querySelector("[role=tabpanel]")!, "Debug logging"))
+      .find((element) => element.tagName === "input" && element.getAttribute("type") === "checkbox")!;
+    updatedDebug.checked = true;
+    updatedDebug.dispatch("change");
+    await vi.waitFor(() => expect(plugin.config.debugLogging).toBe(true));
+  });
+
+  it("updates the overview status dot with accessible aggregate state", async () => {
+    vi.stubGlobal("document", { hidden: false });
+    vi.stubGlobal("window", {});
+    const { plugin, tab } = await createPlugin();
+    const indicator = descendants(tab.containerEl).find((element) => element.getAttribute("role") === "status")!;
+    expect(indicator.getAttribute("aria-label")).toBe("Sync status: Disconnected");
+    expect(indicator.classes).toContain("flash-sync-status-dot-gray");
+
+    plugin.status.connected = true;
+    plugin.status.reconciled = true;
+    plugin.status.refresh();
+    expect(indicator.getAttribute("aria-label")).toBe("Sync status: Synchronized");
+    expect(indicator.classes).toContain("flash-sync-status-dot-green");
+
+    plugin.status.conflictPaths = ["note.conflict.md"];
+    plugin.status.refresh();
+    expect(indicator.getAttribute("aria-label")).toBe("Sync status: 1 conflict");
+    expect(indicator.classes).toContain("flash-sync-status-dot-yellow");
+
+    plugin.status.conflictPaths = [];
+    plugin.status.markError("write");
+    expect(indicator.getAttribute("aria-label")).toBe("Sync status: Sync error");
+    expect(indicator.classes).toContain("flash-sync-status-dot-red");
+  });
+
+  it("commits an inline limit once per changed value and keeps invalid values unsaved", async () => {
+    vi.stubGlobal("document", { hidden: false });
+    vi.stubGlobal("window", {});
+    const { plugin, tab } = await createPlugin();
+    const applyDraft = vi.spyOn(plugin, "applyDraft");
+    tab.containerEl.querySelectorAll('button[role="tab"]')[4].click();
+    const panel = tab.containerEl.querySelector("[role=tabpanel]")!;
+    const input = descendants(findSetting(panel, "Inline Markdown limit (KiB)"))
+      .find((element) => element.getAttribute("aria-label") === "Inline Markdown limit in KiB")!;
+
+    input.value = "512";
+    input.dispatch("change");
+    input.dispatch("blur");
+    await vi.waitFor(() => expect(plugin.config.inlineLimit).toBe(512 * 1024));
+    expect(applyDraft).toHaveBeenCalledTimes(1);
+
+    const updatedPanel = tab.containerEl.querySelector("[role=tabpanel]")!;
+    const invalid = descendants(findSetting(updatedPanel, "Inline Markdown limit (KiB)"))
+      .find((element) => element.getAttribute("aria-label") === "Inline Markdown limit in KiB")!;
+    invalid.value = "0";
+    invalid.dispatch("change");
+    await vi.waitFor(() => expect(applyDraft).toHaveBeenCalledTimes(2));
+    expect(plugin.config.inlineLimit).toBe(512 * 1024);
+  });
+
+  it("composes rapid Advanced control commits against the latest saved settings", async () => {
+    vi.stubGlobal("document", { hidden: false });
+    vi.stubGlobal("window", {});
+    const { plugin, tab } = await createPlugin();
+    tab.containerEl.querySelectorAll('button[role="tab"]')[4].click();
+    const panel = tab.containerEl.querySelector("[role=tabpanel]")!;
+    const minimal = descendants(findSetting(panel, "Status bar presentation"))
+      .find((element) => element.tagName === "input" && element.getAttribute("value") === "minimal")!;
+    const debug = descendants(findSetting(panel, "Debug logging"))
+      .find((element) => element.tagName === "input" && element.getAttribute("type") === "checkbox")!;
+
+    minimal.checked = true;
+    minimal.dispatch("change");
+    debug.checked = true;
+    debug.dispatch("change");
+    await vi.waitFor(() => expect(plugin.config).toMatchObject({ statusBarMode: "minimal", debugLogging: true }));
+  });
+
+  it("restores Advanced controls from persisted settings after a save failure", async () => {
+    vi.stubGlobal("document", { hidden: false });
+    vi.stubGlobal("window", {});
+    const { plugin, tab } = await createPlugin();
+    vi.spyOn(plugin, "saveData").mockRejectedValueOnce(new Error("disk full"));
+    tab.containerEl.querySelectorAll('button[role="tab"]')[4].click();
+    const panel = tab.containerEl.querySelector("[role=tabpanel]")!;
+    const minimal = descendants(findSetting(panel, "Status bar presentation"))
+      .find((element) => element.tagName === "input" && element.getAttribute("value") === "minimal")!;
+
+    minimal.checked = true;
+    minimal.dispatch("change");
+    await vi.waitFor(() => expect(ui.notices.at(-1)).toContain("Could not save settings"));
+    expect(plugin.config.statusBarMode).toBe("extended");
+    const restored = descendants(findSetting(tab.containerEl.querySelector("[role=tabpanel]")!, "Status bar presentation"))
+      .find((element) => element.tagName === "input" && element.getAttribute("value") === "extended");
+    expect(restored?.checked).toBe(true);
+  });
+
   it("shows a reactive attachment settings action for configuration and transfer errors", async () => {
     vi.stubGlobal("document", { hidden: false });
     vi.stubGlobal("window", {});
@@ -251,6 +395,138 @@ describe("settings UI interactions", () => {
     plugin.status.refresh();
     action.click();
     await vi.waitFor(() => expect(tab.containerEl.querySelector("[role=tabpanel]")?.id).toBe("flash-sync-panel-attachments"));
+  });
+
+  it("renders Minimal and Extended status modes through one accessible click target", async () => {
+    vi.stubGlobal("document", { hidden: false });
+    vi.stubGlobal("window", {});
+    const { plugin, app } = await createPlugin();
+    const item = (plugin as unknown as { statusItems: Array<InstanceType<typeof ui.FakeElement>> }).statusItems[0];
+    expect(item.getAttribute("aria-label")).toBe("Disconnected");
+    expect(item.textContent).toContain("Disconnected");
+    expect(ui.setIcon).toHaveBeenLastCalledWith(expect.anything(), "cloud-off");
+
+    item.click();
+    expect(app.setting.open).toHaveBeenCalledOnce();
+    expect(app.setting.openTabById).toHaveBeenCalledWith("flash-sync");
+
+    await plugin.applyDraft({ ...plugin.config, statusBarMode: "minimal", attachmentsEnabled: false, natsPassword: "", s3Secret: "" }, "advanced");
+    plugin.status.connected = true;
+    plugin.status.reconciled = true;
+    plugin.status.refresh();
+    expect(item.getAttribute("aria-label")).toBe("Synchronized");
+    expect(item.textContent).toBe("");
+    expect(ui.setIcon).toHaveBeenLastCalledWith(expect.anything(), "cloud-check");
+  });
+
+  it("keeps conflicts collapsed, opens a separate review note, and confirms scoped actions", async () => {
+    vi.stubGlobal("document", { hidden: false });
+    vi.stubGlobal("window", {});
+    const { plugin, tab } = await createPlugin();
+    const compareConflict = vi.fn().mockResolvedValue({
+      remote: { path: "note.md", hash: "remote-hash", size: 12, revision: 7, content: "remote text" },
+      local: { path: "note.conflict.md", hash: "copy-hash", size: 11, content: "local text" },
+      stale: { remote: true, local: false },
+    });
+    const keepRemote = vi.fn().mockResolvedValue(undefined);
+    const keepLocalCopy = vi.fn().mockResolvedValue(undefined);
+    const createConflictReview = vi.fn().mockResolvedValue("Flash Sync Conflict Reviews/note.md-unique.md");
+    (plugin as unknown as { store: unknown; engine: unknown }).store = {
+      unresolvedConflicts: vi.fn().mockResolvedValue([{ operationId: "conflict-1", originalFileId: "file-1", originalPath: "note.md",
+        copyFileId: "copy-1", copyPath: "note.conflict.md", remoteRevision: 7, lifecycle: "unresolved",
+        detectionRemoteHash: "detected-remote", detectionCopyHash: "copy-hash" }]),
+      conflictHistory: vi.fn().mockResolvedValue([{ operationId: "conflict-1", event: "detected", context: "merge", createdAt: 1 }]),
+    };
+    (plugin as unknown as { engine: unknown }).engine = { compareConflict, keepRemote, keepLocalCopy, markResolved: vi.fn() };
+    vi.spyOn(plugin, "createConflictReview").mockImplementation(createConflictReview);
+    tab.display();
+
+    await vi.waitFor(() => expect(tab.containerEl.textContent).toContain("note.md · Needs review"));
+    expect(findText(tab.containerEl, "note.md · Needs review").tagName).toBe("summary");
+    expect(tab.containerEl.textContent).toContain("Original: note.md");
+    expect(tab.containerEl.textContent).toContain("Preserved copy: note.conflict.md");
+    expect(tab.containerEl.textContent).not.toContain("remote text");
+    expect(tab.containerEl.textContent).not.toContain("local text");
+    expect(compareConflict).not.toHaveBeenCalled();
+    expect(tab.containerEl.textContent).toContain("Conflict history");
+
+    findButton(tab.containerEl, "Review comparison").click();
+    await vi.waitFor(() => expect(createConflictReview).toHaveBeenCalledWith("conflict-1"));
+
+    findButton(tab.containerEl, "Keep remote").click();
+    const modal = ui.modals.at(-1)!;
+    expect(modal.contentEl.textContent).toContain("Keep remote");
+    findButton(modal.contentEl, "Confirm").click();
+    await vi.waitFor(() => expect(keepRemote).toHaveBeenCalledWith("conflict-1"));
+    findButton(tab.containerEl, "Keep local copy").click();
+    findButton(ui.modals.at(-1)!.contentEl, "Confirm").click();
+    await vi.waitFor(() => expect(keepLocalCopy).toHaveBeenCalledWith("conflict-1"));
+  });
+
+  it("keeps conflict contents out of settings and confirms manual resolution separately", async () => {
+    vi.stubGlobal("document", { hidden: false });
+    vi.stubGlobal("window", {});
+    const { plugin, tab } = await createPlugin();
+    const markResolved = vi.fn().mockResolvedValue(undefined);
+    (plugin as unknown as { store: unknown; engine: unknown }).store = {
+      unresolvedConflicts: vi.fn().mockResolvedValue([{ operationId: "conflict-blob", originalFileId: "file-blob", originalPath: "image.png",
+        copyFileId: "copy-blob", copyPath: "image.conflict.png", remoteRevision: 4, lifecycle: "unresolved", kind: "blob" }]),
+      conflictHistory: vi.fn().mockResolvedValue([]),
+    };
+    const compareConflict = vi.fn().mockResolvedValue({
+      remote: { path: "image.png", hash: "remote-blob", size: 900_000, revision: 4 },
+      local: { path: "image.conflict.png", hash: "local-blob", size: 900_001 }, stale: { remote: false, local: false },
+    });
+    (plugin as unknown as { engine: unknown }).engine = { compareConflict, keepRemote: vi.fn(), keepLocalCopy: vi.fn(), markResolved };
+    tab.display();
+
+    await vi.waitFor(() => expect(tab.containerEl.textContent).toContain("image.png · Needs review"));
+    expect(tab.containerEl.textContent).not.toContain("Metadata-only comparison");
+    expect(compareConflict).not.toHaveBeenCalled();
+    findButton(tab.containerEl, "Mark resolved after manual edit or delete").click();
+    findButton(ui.modals.at(-1)!.contentEl, "Confirm").click();
+    await vi.waitFor(() => expect(markResolved).toHaveBeenCalledWith("conflict-blob"));
+  });
+
+  it("creates a unique, opened review snapshot outside sync capture", async () => {
+    vi.stubGlobal("document", { hidden: false });
+    vi.stubGlobal("window", {});
+    const { plugin, app, vaultEntries } = await createPlugin();
+    (plugin as unknown as { store: unknown; engine: unknown }).store = {
+      unresolvedConflicts: vi.fn().mockResolvedValue([{ operationId: "conflict-note", originalFileId: "file", originalPath: "long/path/note.md",
+        copyFileId: "copy", copyPath: "long/path/note.conflict.md", remoteRevision: 3, lifecycle: "unresolved" }]),
+    };
+    (plugin as unknown as { engine: unknown }).engine = { compareConflict: vi.fn().mockResolvedValue({
+      remote: { path: "long/path/note.md", hash: "remote", size: 4, revision: 3, content: "old\n" },
+      local: { path: "long/path/note.conflict.md", hash: "copy", size: 4, content: "new\n" }, stale: { remote: false, local: false },
+    }) };
+
+    const first = await plugin.createConflictReview("conflict-note");
+    const second = await plugin.createConflictReview("conflict-note");
+    expect(first).toMatch(/^Flash Sync Conflict Reviews\/note\.md-/);
+    expect(second).not.toBe(first);
+    expect(vaultEntries.get(first)).toContain("# Conflict review: note.md");
+    expect(vaultEntries.get(first)).toContain("-old");
+    expect(vaultEntries.get(first)).toContain("+new");
+    expect(app.workspace.openLinkText).toHaveBeenCalledWith(first, "", false);
+  });
+
+  it("caps a long source basename before creating its unique review snapshot", async () => {
+    vi.stubGlobal("document", { hidden: false });
+    vi.stubGlobal("window", {});
+    const { plugin } = await createPlugin();
+    const basename = `${"a".repeat(400)}.md`;
+    (plugin as unknown as { store: unknown; engine: unknown }).store = {
+      unresolvedConflicts: vi.fn().mockResolvedValue([{ operationId: "long-name", originalFileId: "file", originalPath: basename,
+        copyFileId: "copy", copyPath: "copy.md", remoteRevision: 1, lifecycle: "unresolved" }]),
+    };
+    (plugin as unknown as { engine: unknown }).engine = { compareConflict: vi.fn().mockResolvedValue({
+      remote: { path: basename, hash: "remote", size: 1, content: "a" },
+      local: { path: "copy.md", hash: "copy", size: 1, content: "b" }, stale: { remote: false, local: false },
+    }) };
+
+    const path = await plugin.createConflictReview("long-name");
+    expect(path.split("/").at(-1)!.length).toBeLessThan(255);
   });
 
   it("validates an empty Connection draft before connect and focuses the first invalid field", async () => {

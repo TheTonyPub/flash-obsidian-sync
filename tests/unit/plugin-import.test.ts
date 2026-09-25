@@ -33,7 +33,7 @@ function configure(plugin: EasySyncPlugin, boundVaultId = "") {
   plugin.config = {
     vaultId: "OLD_VAULT", boundVaultId, deviceId: "device", server: "wss://old.example.com", username: "old-user",
     passwordSecretKey: "old-password", s3Endpoint: "", s3Bucket: "", s3Region: "us-east-1", s3AccessKeyId: "",
-    s3SecretKeySecretKey: "", inlineLimit: 262144, debugLogging: false,
+    s3SecretKeySecretKey: "", inlineLimit: 262144, debugLogging: false, statusBarMode: "extended",
   };
 }
 

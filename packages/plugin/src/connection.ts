@@ -64,7 +64,7 @@ export class SyncStatus {
   refresh(): void {
     if (this.value === "AUTH_ERROR") { this.emit(); return; }
     if (!this.connected) this.value = "OFFLINE";
-    else if (this.conflicts > 0) this.value = "CONFLICT";
+    else if (Math.max(this.conflicts, this.conflictPaths.length) > 0) this.value = "CONFLICT";
     else if (this.errors > 0) this.value = "ERROR";
     else if (!this.reconciled) this.value = "RECONCILING";
     else if (this.pending > 0 || this.blobsPending > 0) this.value = "PENDING";
@@ -76,8 +76,9 @@ export class SyncStatus {
 }
 
 export function statusSummary(status: SyncStatus): string {
-  return status.conflictPaths.length
-    ? `${status.value} · ${status.conflictPaths.length} ${status.conflictPaths.length === 1 ? "copy" : "copies"} to review`
+  const conflicts = Math.max(status.conflicts, status.conflictPaths.length);
+  return conflicts
+    ? `${status.value} · ${conflicts} ${conflicts === 1 ? "copy" : "copies"} to review`
     : status.value;
 }
 
@@ -137,11 +138,30 @@ export class NatsKvAdapter implements KvPort {
   }
 
   async list(): Promise<Array<{ key: string; value: Uint8Array; revision: number }>> {
-    const entries: Array<{ key: string; value: Uint8Array; revision: number }> = [];
+    const startedAt = performance.now();
+    const keys: string[] = [];
     for await (const key of await this.kv.keys()) {
-      const value = await this.get(key);
-      if (value) entries.push({ key, ...value });
+      keys.push(key);
     }
+    // KV keys only returns names, so retrieving their values serially makes a
+    // reconciliation take one round trip per file. Keep the result ordered by
+    // key discovery while limiting pressure on the NATS connection.
+    const values: Array<RemoteEntry | null> = new Array(keys.length).fill(null);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < keys.length) {
+        const index = next++;
+        values[index] = await this.get(keys[index]!);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(8, keys.length) }, worker));
+    const entries = keys.flatMap((key, index) => {
+      const value = values[index];
+      return value ? [{ key, ...value }] : [];
+    });
+    this.logger?.debug("nats.list.complete", {
+      keys: keys.length, entries: entries.length, durationMs: Math.round(performance.now() - startedAt),
+    });
     return entries;
   }
 
