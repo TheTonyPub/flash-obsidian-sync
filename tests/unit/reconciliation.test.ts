@@ -303,7 +303,8 @@ describe("reconciliation and durable replay", () => {
     expect(await session.snapshot[Symbol.asyncIterator]().next()).toMatchObject({ done: true });
 
     const tombstoneBase = record("deleted", "deleted.md", "old");
-    const { content: _content, ...tombstoneRecord } = tombstoneBase;
+    const { content, ...tombstoneRecord } = tombstoneBase;
+    void content;
     const tombstone: KvFileEntry = { key: "f.deleted", value: encodeRecord({ ...tombstoneRecord, deleted: true, size: 0 }), revision: 12 };
     const withTombstone = new SnapshotKvSessionDouble(1);
     withTombstone.pushSnapshot(tombstone);
@@ -315,7 +316,8 @@ describe("reconciliation and durable replay", () => {
 
   it("reconciles a reused path by file identity, retaining the old tombstone and new owner", async () => {
     const kv = new NatsKvDouble();
-    const { content: _content, ...oldRecord } = record("file-a", "shared.md", "old");
+    const { content, ...oldRecord } = record("file-a", "shared.md", "old");
+    void content;
     const deleted = { ...oldRecord, deleted: true, size: 0 };
     const current = record("file-b", "shared.md", "new owner");
     kv.create("f.file-a", encodeRecord(deleted));
@@ -370,7 +372,8 @@ describe("reconciliation and durable replay", () => {
     vault.write("note.md", bytes("before"));
     await local.putFile(indexEntry("file-a", "note.md", "before", liveRevision));
     const tombstoneBase = record("file-a", "note.md", "before", "remote-delete");
-    const { content: _content, ...tombstoneRecord } = tombstoneBase;
+    const { content, ...tombstoneRecord } = tombstoneBase;
+    void content;
     const tombstone = { ...tombstoneRecord, deleted: true, size: 0 };
     const session = new SnapshotKvSessionDouble(1);
     session.pushSnapshot({ key: "f.file-a", value: encodeRecord(tombstone), revision: liveRevision + 1 });
@@ -391,7 +394,8 @@ describe("reconciliation and durable replay", () => {
   it("recovers a reused path from the snapshot while preserving ownership by fileId", async () => {
     const backend = new NatsKvDouble();
     const tombstoneBase = record("file-a", "shared.md", "old", "delete-a");
-    const { content: _content, ...tombstoneFields } = tombstoneBase;
+    const { content, ...tombstoneFields } = tombstoneBase;
+    void content;
     const tombstone = { ...tombstoneFields, deleted: true, size: 0 };
     backend.create("f.file-a", encodeRecord(tombstone));
     const renamed = record("file-b", "previous.md", "reused content", "create-b");

@@ -40,7 +40,7 @@ describe.skipIf(!serverUrl)("KV discovery benchmark", () => {
           const session = await adapter.openSnapshotSession();
           let count = 0;
           try {
-            for await (const _entry of session.snapshot) count++;
+            for await (const entry of session.snapshot) { count++; void entry; }
             await session.snapshotComplete;
           } finally {
             await session.stop();
