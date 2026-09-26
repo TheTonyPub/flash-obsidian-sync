@@ -68,7 +68,7 @@ describe("disposable S3-compatible blob integration", () => {
     const payload = new Uint8Array([0, 1, 2, 3, 255]);
     a.vault.write("image.png", payload);
     await a.engine.captureBytes("image.png", payload);
-    const record = decodeRecord(kv.list()[0]!.value);
+    const record = decodeRecord(kv.list().find((entry) => entry.key.startsWith("f."))!.value);
     expect(record.kind).toBe("blob");
     expect(record.content).toBeUndefined();
     expect(await blob.download(record.blob!.key)).toEqual(payload);
@@ -90,7 +90,8 @@ describe("disposable S3-compatible blob integration", () => {
     await a.engine.captureBytes("offline.bin", offline);
     a.vault.write("note.md", bytes("still live"));
     await a.engine.capture("note.md", "still live");
-    expect(kv.list().map((entry) => decodeRecord(entry.value)).find((entry) => entry.path === "note.md")?.content)
+    expect(kv.list().filter((entry) => entry.key.startsWith("f.")).map((entry) => decodeRecord(entry.value))
+      .find((entry) => entry.path === "note.md")?.content)
       .toBe("still live");
     expect((await a.store.pending()).some((entry) => entry.path === "offline.bin")).toBe(true);
   }, 30000);
