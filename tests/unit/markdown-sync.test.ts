@@ -339,7 +339,9 @@ describe("inline Markdown sync", () => {
     expect(text(a.vault, "notes/todo.md")).toBe("A");
     expect(text(a.vault, "notes/todo_diff.md")).toBe("B");
     expect(await a.store.pending()).toEqual([]);
-    expect(a.status.conflicts).toBeGreaterThan(0);
+    expect(a.status.conflicts).toBe(0);
+    expect(await a.store.unresolvedConflicts()).toEqual([]);
+    expect(a.status.lastError).toContain("source file still exists");
     a.engine.stop(); a.store.close();
   });
 
