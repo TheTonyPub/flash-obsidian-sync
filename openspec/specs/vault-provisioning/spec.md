@@ -34,7 +34,7 @@ Bootstrap SHALL generate a separate NATS administrator password with cryptograph
 
 #### Scenario: Successful noninteractive bootstrap
 - **WHEN** unattended installation and verification complete
-- **THEN** the CLI writes the generated credentials only to an explicitly selected owner-readable destination and does not print them into general automation logs
+- **THEN** the CLI writes generated credentials only to an explicitly selected owner-readable destination and does not print them into general automation logs
 
 #### Scenario: Missing administrator credential later
 - **WHEN** an operator invokes a KV management command without valid administrator credentials

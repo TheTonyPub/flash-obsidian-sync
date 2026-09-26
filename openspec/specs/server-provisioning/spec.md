@@ -7,10 +7,18 @@ Defines the user-run server installer and operator controls for a reproducible, 
 ## Requirements
 
 ### Requirement: Source installation guide
-The repository SHALL provide a root README before server-CLI implementation. It SHALL state prerequisites for building `flash-osidian-sync` from source, obtaining a usable NATS WSS endpoint and pre-created vault bucket, and optional S3-dependent features. It SHALL give reproducible manual installation and enablement steps for the built plugin under `.obsidian/plugins/flash-osidian-sync` in a desktop Obsidian vault, plus a basic connection check. It SHALL distinguish this source-install path from later Community Plugins directory publication.
+The repository SHALL provide a root README with prerequisites for using `flash-sync`: a supported Obsidian version, reachable NATS WSS endpoint, pre-created vault bucket and credentials, and optional S3-dependent features. It SHALL explain how to download the matching `main.js` and `manifest.json` from a stable or prerelease GitHub Release, or from a development CI artifact, and manually install both under `.obsidian/plugins/flash-sync` in a desktop Obsidian vault. It SHALL direct users to install `styles.css` only when the selected build uses custom CSS, and distinguish these installation files from GitHub-generated Source code (zip) and Source code (tar.gz) archives. It SHALL give a basic connection check, describe source-build installation as an optional path, and distinguish manual installation from Community Plugins directory publication. It SHALL identify stable releases as the only Community Directory candidates.
+
+#### Scenario: Manual installation from release
+- **WHEN** a user downloads both assets from one stable or prerelease version and follows the README
+- **THEN** the user can place them under `.obsidian/plugins/flash-sync`, enable the plugin, and identify the settings needed to connect to an existing server
+
+#### Scenario: Manual installation from development artifact
+- **WHEN** a user chooses a development CI artifact and follows the README
+- **THEN** the user can install its two matching files manually and identify that it is a development build
 
 #### Scenario: Manual installation from source
-- **WHEN** a user follows the README on a supported development machine with the stated prerequisites
+- **WHEN** a user follows the optional source-build path on a supported development machine
 - **THEN** the user can build the plugin, place its required artifacts in the vault's plugin directory, enable it in Obsidian, and identify the settings needed to connect to an existing server
 
 #### Scenario: Server is not yet available
@@ -20,17 +28,6 @@ The repository SHALL provide a root README before server-CLI implementation. It 
 #### Scenario: S3 is not available
 - **WHEN** the user installs the plugin without external S3 configuration
 - **THEN** the README explains that inline Markdown remains the intended NATS-only path and images are not synchronized until S3 is configured
-
-### Requirement: Preserve plugin state across identity rename
-The plugin SHALL use manifest ID and display name `flash-osidian-sync`. An existing `easy-sync` installation SHALL have a documented, retry-safe migration that preserves its settings, SecretStorage references, durable IndexedDB outbox, and vault binding before the new identity connects or writes remote state. It SHALL not silently reset credentials, orphan pending changes, or delete legacy data. The old import protocol link SHALL remain recognized during a compatibility window.
-
-#### Scenario: Existing plugin is upgraded
-- **WHEN** a vault has `easy-sync` settings and local pending operations and installs `flash-osidian-sync`
-- **THEN** the new plugin restores the settings and outbox before connecting, retains the old data for rollback, and reports a recoverable error if migration cannot complete
-
-#### Scenario: Fresh installation
-- **WHEN** no legacy plugin data exists
-- **THEN** the new identity initializes normally without creating or modifying legacy data
 
 ### Requirement: Install fos from repository source
 The repository SHALL provide separate Markdown guides for installing `fos` from this repository's source and for using its interactive and unattended commands. The installation guide SHALL cover supported server OS/architecture, Node.js/npm prerequisites, a reproducible source build, installation of the locally built `fos` package, verification of the installed executable and bundled admin worker, and updates from a later source revision. It SHALL NOT instruct operators to install `fos` from APT. Native-mode NATS and Caddy are separate, version-pinned stock-APT dependencies managed by `fos`; Docker and Podman modes require their supported Compose runtimes.
@@ -160,3 +157,10 @@ Bootstrap SHALL separately offer firewall management, dedicated service accounts
 #### Scenario: Upgrade or uninstall
 - **WHEN** an operator invokes a supported upgrade or uninstall action
 - **THEN** the CLI previews effects, requests confirmation, preserves data by default, and reports rollback or recovery instructions
+
+### Requirement: Flash Sync plugin identity
+The plugin SHALL use manifest ID and display name `flash-sync`.
+
+#### Scenario: Fresh installation
+- **WHEN** a user installs the plugin under `.obsidian/plugins/flash-sync`
+- **THEN** Obsidian recognizes and displays it as `flash-sync`
