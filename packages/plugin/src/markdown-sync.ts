@@ -156,7 +156,7 @@ export class MarkdownSyncEngine {
     const indexed = await store.getFileByPath(from);
     if (!indexed) return;
     if (await vault.read(from)) {
-      this.conflict();
+      this.reportRecoverableIssue("Rename was deferred because the source file still exists.");
       return;
     }
     const bytes = await vault.read(to);
@@ -441,7 +441,7 @@ export class MarkdownSyncEngine {
       for (const entry of remote) {
         let record: RemoteFileRecord;
         try { record = decodeRecord(entry.value); }
-        catch { this.conflict(); continue; }
+        catch { this.reportRecoverableIssue("A remote file record could not be decoded during reconciliation."); continue; }
         if (isConflictReviewPath(record.path)) continue;
         if (!record.deleted) remotePaths.add(record.path);
         if (record.deleted) { await this.applyRemote(entry.value, entry.revision); remoteApplied++; continue; }
@@ -522,7 +522,7 @@ export class MarkdownSyncEngine {
     }).catch((error: unknown) => {
       this.options.status.lastError = errorSummary(error);
       this.options.logger?.error("watch.apply", error);
-      this.conflict();
+      this.refreshConflictCount();
     });
   }
 
@@ -530,7 +530,7 @@ export class MarkdownSyncEngine {
     const path = record.path.replace(/\.md$/, `.conflict-${this.options.deviceId}-${record.fileId}.md`);
     const existing = await this.options.vault.read(path);
     if (existing && new TextDecoder().decode(existing) !== localContent) {
-      this.conflict();
+      this.reportRecoverableIssue("A bootstrap conflict copy path is occupied by different content.");
       return false;
     }
     const bytes = new TextEncoder().encode(localContent);
@@ -551,7 +551,10 @@ export class MarkdownSyncEngine {
   private async preserveBootstrapBytes(record: RemoteFileRecord, bytes: Uint8Array): Promise<boolean> {
     const path = this.collisionPath(record.path, record.fileId);
     const existing = await this.options.vault.read(path);
-    if (existing && sha256Hex(existing) !== sha256Hex(bytes)) { this.conflict(); return false; }
+    if (existing && sha256Hex(existing) !== sha256Hex(bytes)) {
+      this.reportRecoverableIssue("A bootstrap conflict copy path is occupied by different content.");
+      return false;
+    }
     const operationId = `bootstrap-${record.fileId}-${sha256Hex(bytes)}`;
     await this.options.store.putConflict({ operationId, originalFileId: record.fileId, originalPath: record.path,
       copyFileId: conflictCopyId(record.fileId, operationId), copyPath: path, remoteRevision: (await this.options.kv.get(`f.${record.fileId}`))?.revision ?? 0,
@@ -718,7 +721,7 @@ export class MarkdownSyncEngine {
           return;
         }
         if (!remote || remote.content === undefined || localContent === undefined) {
-          this.conflict();
+          this.reportRecoverableIssue("The remote base needed to safely merge this edit is unavailable.");
           throw new Error("Remote base unavailable");
         }
         const result = resolveMarkdown(operation.baseContent, localContent, remote.content);
@@ -1186,8 +1189,14 @@ export class MarkdownSyncEngine {
     this.options.logger?.error(event, error);
   }
 
-  private conflict(): void {
-    this.options.status.conflicts++;
+  private reportRecoverableIssue(message: string): void {
+    this.options.status.lastError = message;
+    this.options.logger?.error("sync.recoverable_issue", new Error(message));
+    this.refreshConflictCount();
+  }
+
+  private refreshConflictCount(): void {
+    this.options.status.conflicts = this.options.status.conflictPaths.length;
     this.options.status.refresh();
   }
 
@@ -1219,7 +1228,8 @@ export class MarkdownSyncEngine {
 
   private async applyRemote(value: Uint8Array, revision: number): Promise<void> {
     let record: RemoteFileRecord;
-    try { record = decodeRecord(value); } catch { this.conflict(); return; }
+    try { record = decodeRecord(value); }
+    catch { this.reportRecoverableIssue("A remote file record could not be decoded."); return; }
     if (isConflictReviewPath(record.path)) return;
     const { store, vault } = this.options;
     const current = await store.getFile(record.fileId);
@@ -1254,7 +1264,7 @@ export class MarkdownSyncEngine {
     if (local && current && !current.deleted && sha256Hex(local) !== current.localHash) {
       await this.captureBytes(localPath, local);
       if ((await store.pending()).some((item) => item.fileId === record.fileId)) {
-        this.conflict();
+        this.reportRecoverableIssue("A local edit was queued while applying a remote update; the update was deferred.");
         return;
       }
     }
