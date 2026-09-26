@@ -32,7 +32,7 @@ describe("blob publication and apply", () => {
     expect(await r.store.pending()).toHaveLength(1);
     expect(r.kv.list()).toHaveLength(0);
     release(); await publishing;
-    const record = decodeRecord(r.kv.list()[0]!.value);
+    const record = decodeRecord(r.kv.list().find((entry) => entry.key.startsWith("f."))!.value);
     expect(record.kind).toBe("blob");
     expect(record.content).toBeUndefined();
     expect(record.blob?.key).toBe(blobObjectKey("VAULT", sha256Hex(image)));
@@ -47,7 +47,7 @@ describe("blob publication and apply", () => {
     await r.engine.capture("small.md", "short");
     r.vault.write("large.md", bytes("x".repeat(512)));
     await r.engine.capture("large.md", "x".repeat(512));
-    const records = r.kv.list().map((entry) => decodeRecord(entry.value));
+    const records = r.kv.list().filter((entry) => entry.key.startsWith("f.")).map((entry) => decodeRecord(entry.value));
     expect(records.find((record) => record.path === "small.md")?.kind).toBe("text");
     expect(records.find((record) => record.path === "large.md")?.kind).toBe("blob");
     r.engine.stop(); await r.engine.settle(); r.store.close();
@@ -75,7 +75,7 @@ describe("blob publication and apply", () => {
     await r.engine.captureBytes("image.png", image);
     r.vault.write("note.md", bytes("live"));
     await r.engine.capture("note.md", "live");
-    expect(r.kv.list().map((entry) => decodeRecord(entry.value).path)).toContain("note.md");
+    expect(r.kv.list().filter((entry) => entry.key.startsWith("f.")).map((entry) => decodeRecord(entry.value).path)).toContain("note.md");
     expect((await r.store.pending()).some((operation) => operation.path === "image.png")).toBe(true);
     r.engine.stop(); await r.engine.settle(); r.store.close();
   });

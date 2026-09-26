@@ -27,8 +27,9 @@ describe("file lifecycle", () => {
     a.vault.rename("old.md", "new.md");
     await a.engine.rename("old.md", "new.md");
     await b.engine.settle();
-    expect(kv.list()).toHaveLength(1);
-    expect(decodeRecord(kv.list()[0]!.value)).toMatchObject({ fileId: id, path: "new.md" });
+    const fileRecords = kv.list().filter((entry) => entry.key.startsWith("f."));
+    expect(fileRecords).toHaveLength(1);
+    expect(decodeRecord(fileRecords[0]!.value)).toMatchObject({ fileId: id, path: "new.md" });
     expect(text(b.vault.read("old.md"))).toBeUndefined();
     expect(text(b.vault.read("new.md"))).toBe("body");
     expect((await b.store.getFileByPath("new.md"))?.fileId).toBe(id);
@@ -42,7 +43,7 @@ describe("file lifecycle", () => {
     a.vault.delete("note.md");
     await a.engine.remove("note.md");
     await b.engine.settle();
-    expect(decodeRecord(kv.list()[0]!.value).deleted).toBe(true);
+    expect(decodeRecord(kv.list().find((entry) => entry.key.startsWith("f."))!.value).deleted).toBe(true);
     expect(b.vault.read("note.md")).toBeUndefined();
     a.engine.stop(); b.engine.stop(); await a.engine.settle(); await b.engine.settle(); a.store.close(); b.store.close();
   });
@@ -77,7 +78,7 @@ describe("file lifecycle", () => {
       deleted: false, contentHash: sha256Hex(bytes(content)), size: bytes(content).length, content,
       origin: { deviceId: "other", operationId: "other-create", clientTime: 0 } }));
     await a.engine.reconcile();
-    const records = kv.list().map((entry) => decodeRecord(entry.value)).filter((entry) => !entry.deleted);
+    const records = kv.list().filter((entry) => entry.key.startsWith("f.")).map((entry) => decodeRecord(entry.value)).filter((entry) => !entry.deleted);
     expect(new Set(records.map((entry) => entry.path)).size).toBe(2);
     expect(a.vault.listMarkdown().map((entry) => entry.content).sort()).toEqual(["local", "remote"]);
     a.engine.stop(); await a.engine.settle(); a.store.close();

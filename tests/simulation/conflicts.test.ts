@@ -35,7 +35,7 @@ describe("two-replica offline conflict simulations", () => {
         kv.get = savedGet;
         online.vault.write("note.md", encoder.encode(remote));
         await online.engine.capture("note.md", remote);
-        expect(decodeRecord(kv.list()[0]!.value).content).toBe(remote);
+        expect(decodeRecord(kv.list().find((item) => item.key.startsWith("f."))!.value).content).toBe(remote);
         await offline.engine.start();
         const canonical = overlap ? remote : "REMOTE\nLOCAL\n";
         const record = decodeRecord(kv.list().find((item) => item.key.startsWith("f."))!.value);

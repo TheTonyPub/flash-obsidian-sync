@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
+import { unicodeCaseFold } from "./unicode-case-fold.js";
 
 export interface RecordOrigin {
   deviceId: string;
@@ -29,6 +30,14 @@ export interface RemoteFileRecord {
   origin: RecordOrigin;
   basedOnRevision?: number;
   deletion?: { reason?: string };
+}
+
+export interface PathOwnershipRecord {
+  schemaVersion: 1;
+  canonicalPath: string;
+  fileId: string;
+  operationId: string;
+  state: "reserved" | "owned" | "released";
 }
 
 const encoder = new TextEncoder();
@@ -62,6 +71,43 @@ export function normalizePath(value: string): string {
     throw new Error("Invalid path");
   }
   return path;
+}
+
+/** Canonical path identity uses the pinned Unicode 13.0.0 default case-fold table. */
+export function canonicalizeRemotePath(value: string): string {
+  return Array.from(normalizePath(value), (character) => {
+    const codePoint = character.codePointAt(0)!;
+    return unicodeCaseFold.get(codePoint) ?? character;
+  }).join("");
+}
+
+export function pathOwnershipKey(path: string): string {
+  return `p.${sha256Hex(encoder.encode(canonicalizeRemotePath(path)))}`;
+}
+
+export function encodePathOwnershipRecord(record: PathOwnershipRecord): Uint8Array {
+  validatePathOwnershipRecord(record);
+  return encoder.encode(JSON.stringify(record));
+}
+
+export function decodePathOwnershipRecord(bytes: Uint8Array, key?: string): PathOwnershipRecord {
+  const record = object(JSON.parse(decoder.decode(bytes)));
+  validatePathOwnershipRecord(record);
+  if (key !== undefined && key !== pathOwnershipKey(record.canonicalPath)) throw new Error("Path ownership key mismatch");
+  return record as unknown as PathOwnershipRecord;
+}
+
+function validatePathOwnershipRecord(value: unknown): asserts value is PathOwnershipRecord {
+  const record = object(value);
+  if (record.schemaVersion !== 1) throw new Error("Unsupported path ownership schemaVersion");
+  if (typeof record.canonicalPath !== "string" || canonicalizeRemotePath(record.canonicalPath) !== record.canonicalPath) {
+    throw new Error("Invalid canonicalPath");
+  }
+  id(record.fileId, "fileId");
+  id(record.operationId, "operationId");
+  if (record.state !== "reserved" && record.state !== "owned" && record.state !== "released") {
+    throw new Error("Invalid path ownership state");
+  }
 }
 
 export function createFileId(): string {

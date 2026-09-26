@@ -37,7 +37,7 @@ describe("revision-safe publication", () => {
     a.vault.write("note.md", encoder.encode("ONE\ntwo\n"));
     await a.engine.capture("note.md", "ONE\ntwo\n");
     expect(raced).toBe(true);
-    expect(decodeRecord(kv.list()[0]!.value).content).toBe("ONE\nTWO\n");
+    expect(decodeRecord(kv.list().find((entry) => entry.key.startsWith("f."))!.value).content).toBe("ONE\nTWO\n");
     expect(decoder.decode(a.vault.read("note.md"))).toBe("ONE\nTWO\n");
     expect(await a.store.pending()).toHaveLength(0);
     a.engine.stop(); await a.engine.settle(); a.store.close();
@@ -58,7 +58,7 @@ describe("revision-safe publication", () => {
     await b.engine.capture("note.md", "one\ntwo\nTHREE\n");
     await a.engine.start();
     expect(decoder.decode(a.vault.read("note.md"))).toBe("ONE\ntwo\nTHREE\n");
-    expect(decodeRecord(kv.list()[0]!.value).content).toBe("ONE\ntwo\nTHREE\n");
+    expect(decodeRecord(kv.list().find((entry) => entry.key.startsWith("f."))!.value).content).toBe("ONE\ntwo\nTHREE\n");
     expect(await a.store.pending()).toHaveLength(0);
     a.engine.stop(); b.engine.stop(); await a.engine.settle(); await b.engine.settle(); a.store.close(); b.store.close();
   });

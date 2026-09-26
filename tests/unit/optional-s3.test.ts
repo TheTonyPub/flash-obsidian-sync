@@ -35,10 +35,10 @@ describe("optional S3", () => {
     vault.write("large.md", new TextEncoder().encode(oversizedMarkdown));
     await withoutS3.engine.capture("large.md", oversizedMarkdown);
 
-    expect(kv.list().map((entry) => decodeRecord(entry.value))).toEqual(expect.arrayContaining([
+    expect(kv.list().filter((entry) => entry.key.startsWith("f.")).map((entry) => decodeRecord(entry.value))).toEqual(expect.arrayContaining([
       expect.objectContaining({ path: "note.md", kind: "text" }),
     ]));
-    const publishedPaths = kv.list().map((entry) => decodeRecord(entry.value).path);
+    const publishedPaths = kv.list().filter((entry) => entry.key.startsWith("f.")).map((entry) => decodeRecord(entry.value).path);
     expect(publishedPaths).not.toContain("image.png");
     expect(publishedPaths).not.toContain("large.md");
     expect(vault.read("image.png")).toEqual(image);
@@ -60,8 +60,8 @@ describe("optional S3", () => {
     };
     const withS3 = await engineFor({ kv, vault, store, blob, inlineLimit: 450 });
 
-    const imageRecord = kv.list().map((entry) => decodeRecord(entry.value)).find((record) => record.path === "image.png");
-    const oversizedRecord = kv.list().map((entry) => decodeRecord(entry.value)).find((record) => record.path === "large.md");
+    const imageRecord = kv.list().filter((entry) => entry.key.startsWith("f.")).map((entry) => decodeRecord(entry.value)).find((record) => record.path === "image.png");
+    const oversizedRecord = kv.list().filter((entry) => entry.key.startsWith("f.")).map((entry) => decodeRecord(entry.value)).find((record) => record.path === "large.md");
     expect(imageRecord).toMatchObject({ kind: "blob", blob: { size: image.length } });
     expect(imageRecord).not.toHaveProperty("content");
     expect(oversizedRecord).toMatchObject({ kind: "blob", blob: { size: oversizedMarkdown.length } });

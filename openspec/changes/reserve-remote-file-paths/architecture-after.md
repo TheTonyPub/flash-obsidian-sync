@@ -1,80 +1,80 @@
-# Architecture after the three proposed changes
+# Архитектура после трёх предложенных изменений
 
-This is the target design after `order-delete-before-path-reuse`, `skip-path-scan-for-content-edits`, and `reserve-remote-file-paths` are implemented. It is planning state, not a description of deployed behavior. The proposals retain one KV bucket per vault and do not add a META/BLOB bucket split or reconnect cursor.
+Это целевая архитектура после реализации `order-delete-before-path-reuse`, `skip-path-scan-for-content-edits` и `reserve-remote-file-paths`. Документ описывает планируемое состояние, а не уже развёрнутое поведение. Предложения сохраняют по одному бакету KV на хранилище Obsidian и не предусматривают разделения на бакеты META/BLOB или курсора для повторного подключения.
 
 ```mermaid
 flowchart LR
-  subgraph D1[Device 1 - Obsidian Desktop or Mobile]
-    V1[Local vault files]
-    I1[(IndexedDB file index and durable outbox)]
-    E1[Sync engine: capture, ordered replay, CAS, conflicts]
-    C1[Recoverable conflict copy and review]
+  subgraph D1[Устройство 1 — Obsidian для компьютера или мобильного устройства]
+    V1[Локальные файлы хранилища]
+    I1[(Индекс файлов и устойчивый журнал исходящих операций в IndexedDB)]
+    E1[Механизм синхронизации: фиксация изменений, упорядоченное воспроизведение, CAS, конфликты]
+    C1[Восстанавливаемая копия при конфликте и проверка]
     V1 --> E1
     E1 <--> I1
     E1 --> C1
   end
 
-  subgraph N[Per-vault NATS JetStream KV over WSS]
-    F[(f.fileId records: stable fileId, path, tombstone, inline content or S3 hash reference)]
-    P[(p.pathHash records: canonical path, fileId, reserved or owned or released)]
+  subgraph N[NATS JetStream KV для каждого хранилища через WSS]
+    F[(Записи f.fileId: постоянный fileId, путь, отметка удаления, содержимое в записи или ссылка на хеш в S3)]
+    P[(Записи p.pathHash: канонический путь, fileId, статус «зарезервирован», «принадлежит» или «освобождён»)]
   end
 
-  subgraph S[S3-compatible blob store]
-    B[(SHA-256 addressed oversized and binary blobs)]
+  subgraph S[S3-совместимое хранилище объектов]
+    B[(Крупные и бинарные объекты с адресацией по SHA-256)]
   end
 
-  subgraph D2[Device 2 - Obsidian Desktop or Mobile]
-    V2[Local vault files]
-    I2[(IndexedDB file index and durable outbox)]
-    E2[Sync engine: f-record watch and full reconnect reconciliation]
-    C2[Recoverable conflict copy and review]
+  subgraph D2[Устройство 2 — Obsidian для компьютера или мобильного устройства]
+    V2[Локальные файлы хранилища]
+    I2[(Индекс файлов и устойчивый журнал исходящих операций в IndexedDB)]
+    E2[Механизм синхронизации: отслеживание записей f и полная сверка после повторного подключения]
+    C2[Восстанавливаемая копия при конфликте и проверка]
     V2 --> E2
     E2 <--> I2
     E2 --> C2
   end
 
-  E1 <-->|read and CAS f records| F
-  E1 <-->|reserve and CAS path owner| P
-  E2 <-->|watch f records; full f reconciliation on reconnect| F
-  E2 <-->|read and repair path owner| P
-  E1 <-->|upload or fetch verified hash blob| B
-  E2 <-->|fetch verified hash blob| B
+  E1 <-->|чтение и CAS записей f| F
+  E1 <-->|резервирование и CAS владельца пути| P
+  E2 <-->|отслеживание записей f; полная сверка f после повторного подключения| F
+  E2 <-->|чтение и исправление владельца пути| P
+  E1 <-->|загрузка или получение объекта с проверкой хеша| B
+  E2 <-->|получение объекта с проверкой хеша| B
 ```
 
 ```mermaid
 sequenceDiagram
-  participant V as Local vault
-  participant O as IndexedDB outbox
+  participant V as Локальное хранилище
+  participant O as Журнал операций IndexedDB
   participant P as NATS KV p.pathHash
   participant F as NATS KV f.fileId
-  participant R as Other device
+  participant R as Другое устройство
 
-  V->>O: Queue mutation with stable fileId and dependencies
-  Note over O,F: A delete must be remotely confirmed before B reuses A's path
-  alt Create or rename
-    O->>P: CAS reserve destination path
-    P-->>O: Reservation or competing owner
-    alt Competing fileId owns destination
-      O->>V: Preserve local bytes as conflict copy
-    else Reservation accepted
-      O->>F: CAS live file record with path and inline text or S3 hash
-      F-->>O: Revision or retryable CAS race
-      O->>P: CAS destination to owned
-      opt Rename from a different canonical path
-        O->>P: CAS former path to released
+  V->>O: Поставить изменение в очередь с постоянным fileId и зависимостями
+  Note over O,F: Удаление A должно быть подтверждено удалённым узлом до повторного использования пути A файлом B
+  alt Создание или переименование
+    O->>P: Зарезервировать целевой путь через CAS
+    P-->>O: Резервирование или конкурирующий владелец
+    alt Целевой путь принадлежит другому fileId
+      O->>V: Сохранить локальные данные в копии для разрешения конфликта
+    else Резервирование принято
+      O->>F: Записать через CAS активную запись файла с путём и текстом в записи или хешем S3
+      F-->>O: Ревизия или конфликт CAS, допускающий повторную попытку
+      O->>P: Сменить через CAS статус целевого пути на «принадлежит»
+      opt Переименование с другого канонического пути
+        O->>P: Сменить через CAS статус прежнего пути на «освобождён»
       end
-      O->>O: Acknowledge completed operation
+      O->>O: Подтвердить завершение операции
     end
-  else Delete
-    O->>F: CAS identity-scoped tombstone
-    F-->>O: Confirmed tombstone revision
-    O->>P: CAS deleted file's path to released
-    O->>O: Acknowledge completed delete
+  else Удаление
+    O->>F: Записать через CAS отметку удаления для конкретного fileId
+    F-->>O: Подтверждённая ревизия отметки удаления
+    O->>P: Сменить через CAS статус пути удалённого файла на «освобождён»
+    O->>O: Подтвердить завершение удаления
   end
-  F-->>R: Per-vault file-record watch
-  R->>R: Apply by fileId; full f-record reconciliation on reconnect
-  Note over O,P: Crash recovery reads specific f and p keys and resumes missing CAS steps
-  Note over O,F: Established same-path content edits CAS f directly without a path scan
+  F-->>R: Отслеживание записей файлов в пределах хранилища
+  R->>R: Применить по fileId, полностью сверить записи f после повторного подключения
+  Note over O,P: После сбоя считываются конкретные ключи f и p, затем возобновляются недостающие шаги CAS
+  Note over O,F: Изменения содержимого по прежнему пути обновляют f через CAS без сканирования путей
 ```
 
-Path ownership is authoritative for claims; `f.<fileId>` remains authoritative for file content and tombstone state. A `reserved` path blocks other identities until the originating durable operation resumes or matching `f.` evidence lets a peer finalize it. A genuine collision keeps both contents recoverable. Normal Markdown remains inline in `f.` records; only binary or oversized bytes use S3-compatible SHA-256 blobs.
+Владение путём определяет право занять его; запись `f.<fileId>` остаётся источником истины для содержимого файла и состояния удаления. Статус `reserved` не позволяет другим файлам занять путь, пока исходная устойчивая операция не возобновится или пока другое устройство не завершит её на основании соответствующей записи `f.`. При настоящем конфликте содержимое обоих файлов остаётся доступным для восстановления. Обычный Markdown хранится непосредственно в записях `f.`; только бинарные или слишком большие данные помещаются в S3-совместимое хранилище объектов с адресацией по SHA-256.

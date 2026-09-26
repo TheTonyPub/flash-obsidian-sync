@@ -121,7 +121,7 @@ describe("durable conflict lifecycle contracts", () => {
     expect(record).not.toHaveProperty("winnerByTimestamp");
     expect(record).not.toHaveProperty("clientTimeWinner");
     expect((await local.store.pending()).some((operation) => operation.fileId === record?.copyFileId)).toBe(false);
-    expect(kv.list().some((entry) => decodeRecord(entry.value).path === record?.copyPath)).toBe(false);
+    expect(kv.list().filter((entry) => entry.key.startsWith("f.")).some((entry) => decodeRecord(entry.value).path === record?.copyPath)).toBe(false);
     await local.engine.capture(record!.copyPath, "LOCAL COPY EDIT\n");
     expect(await local.store.pending()).toHaveLength(0);
     await close(local); await close(remoteReplica);
@@ -331,12 +331,13 @@ describe("durable conflict lifecycle contracts", () => {
   it("keeps the local copy pending until CAS confirmation and supports manual edit/delete", async () => {
     const kv = new NatsKvDouble();
     const state = await replica("local-action", kv, "CANONICAL\n");
+    const fileId = (await state.store.getFileByPath("note.md"))!.fileId;
     state.engine.stop();
-    kv.create("f.remote", encodeRecord(remote("remote", "note.md", "REMOTE\n")));
+    kv.put(`f.${fileId}`, encodeRecord(remote(fileId, "note.md", "REMOTE\n")));
     state.vault.write("note.conflict.md", bytes("LOCAL WINNER\n"));
     await state.store.putConflict({
-      operationId: "local-op", originalFileId: "remote", originalPath: "note.md", copyFileId: "copy",
-      copyPath: "note.conflict.md", remoteRevision: kv.get("f.remote")!.revision, lifecycle: "unresolved",
+      operationId: "local-op", originalFileId: fileId, originalPath: "note.md", copyFileId: "copy",
+      copyPath: "note.conflict.md", remoteRevision: kv.get(`f.${fileId}`)!.revision, lifecycle: "unresolved",
       context: "merge", canonicalPath: "note.md", remotePath: "note.md",
       detectionRemoteHash: sha256Hex(bytes("REMOTE\n")), detectionLocalHash: sha256Hex(bytes("CANONICAL\n")),
       detectionCopyHash: sha256Hex(bytes("LOCAL WINNER\n")),
@@ -347,7 +348,7 @@ describe("durable conflict lifecycle contracts", () => {
     expect(text(state.vault, "note.md")).toBe("LOCAL WINNER\n");
     await state.engine.settle();
     expect((await state.store.getConflict("local-op") as LifecycleRecord).lifecycle).toBe("resolved");
-    expect(decodeRecord(kv.get("f.remote")!.value).content).toBe("LOCAL WINNER\n");
+    expect(decodeRecord(kv.get(`f.${fileId}`)!.value).content).toBe("LOCAL WINNER\n");
     await close(state);
   });
 
@@ -355,11 +356,12 @@ describe("durable conflict lifecycle contracts", () => {
     for (const deleted of [false, true]) {
       const kv = new NatsKvDouble();
       const state = await replica(`manual-${deleted}`, kv, "BASE\n");
+      const fileId = (await state.store.getFileByPath("note.md"))!.fileId;
       state.engine.stop();
-      kv.create("f.remote", encodeRecord(remote("remote", "note.md", "REMOTE\n")));
+      kv.put(`f.${fileId}`, encodeRecord(remote(fileId, "note.md", "REMOTE\n")));
       const operationId = deleted ? "manual-delete" : "manual-edit";
-      await state.store.putConflict({ operationId, originalFileId: "remote", originalPath: "note.md", copyFileId: "copy",
-        copyPath: "note.conflict.md", remoteRevision: kv.get("f.remote")!.revision, lifecycle: "unresolved", context: "merge",
+      await state.store.putConflict({ operationId, originalFileId: fileId, originalPath: "note.md", copyFileId: "copy",
+        copyPath: "note.conflict.md", remoteRevision: kv.get(`f.${fileId}`)!.revision, lifecycle: "unresolved", context: "merge",
       } as unknown as ConflictRecord);
       if (deleted) state.vault.delete("note.md");
       else state.vault.write("note.md", bytes("MANUAL EDIT\n"));
@@ -368,7 +370,7 @@ describe("durable conflict lifecycle contracts", () => {
       await engine.markResolved(operationId);
       await state.engine.settle();
       expect((await state.store.getConflict(operationId) as LifecycleRecord).lifecycle).toBe("resolved");
-      expect(decodeRecord(kv.get("f.remote")!.value).deleted).toBe(deleted);
+      expect(decodeRecord(kv.get(`f.${fileId}`)!.value).deleted).toBe(deleted);
       await close(state);
     }
   });
@@ -376,22 +378,23 @@ describe("durable conflict lifecycle contracts", () => {
   it("allows marking resolved after a same-content remote revision bump", async () => {
     const kv = new NatsKvDouble();
     const state = await replica("manual-same-content-revision", kv, "MANUAL EDIT\n");
+    const fileId = (await state.store.getFileByPath("note.md"))!.fileId;
     state.engine.stop();
-    const original = remote("remote", "note.md", "REMOTE\n");
-    const detectedRevision = kv.create("f.remote", encodeRecord(original));
-    await state.store.putConflict({ operationId: "manual-same-content-revision-op", originalFileId: "remote",
+    const original = remote(fileId, "note.md", "REMOTE\n");
+    const detectedRevision = kv.put(`f.${fileId}`, encodeRecord(original));
+    await state.store.putConflict({ operationId: "manual-same-content-revision-op", originalFileId: fileId,
       originalPath: "note.md", copyFileId: "copy", copyPath: "note.conflict.md", remoteRevision: detectedRevision,
       lifecycle: "unresolved", context: "merge", canonicalPath: "note.md", remotePath: "note.md",
       detectionRemoteHash: original.contentHash, detectionLocalHash: original.contentHash,
     } as unknown as ConflictRecord);
 
-    kv.put("f.remote", encodeRecord(original));
+    kv.put(`f.${fileId}`, encodeRecord(original));
     await (state.engine as ResolutionEngine).markResolved("manual-same-content-revision-op");
     await state.engine.settle();
 
     expect((await state.store.getConflict("manual-same-content-revision-op") as LifecycleRecord).lifecycle).toBe("resolved");
     expect(await state.store.pending()).toHaveLength(0);
-    expect(decodeRecord(kv.get("f.remote")!.value).content).toBe("MANUAL EDIT\n");
+    expect(decodeRecord(kv.get(`f.${fileId}`)!.value).content).toBe("MANUAL EDIT\n");
     await close(state);
   });
 
@@ -586,19 +589,11 @@ describe("durable conflict lifecycle contracts", () => {
     state.engine.stop();
     kv.create("f.a-remote", encodeRecord(remote("a-remote", "note.md", "REMOTE\n")));
     state.vault.write("note.conflict-copy.md", bytes("LOCAL\n"));
-    await state.store.putConflict({ operationId: "path-collision-op", originalFileId: "a-remote", originalPath: "note.md",
-      copyFileId: "z-local", copyPath: "note.conflict-copy.md", remoteRevision: kv.get("f.a-remote")!.revision,
-      lifecycle: "unresolved", context: "path-collision", canonicalPath: "note.md", remotePath: "note.md",
-      detectionRemoteHash: sha256Hex(bytes("REMOTE\n")), detectionLocalHash: sha256Hex(bytes("LOCAL\n")),
-      detectionCopyHash: sha256Hex(bytes("LOCAL\n")),
-    } as unknown as ConflictRecord);
+    await state.engine.reconcile();
 
-    await (state.engine as ResolutionEngine).keepLocalCopy("path-collision-op");
-
-    expect(text(state.vault, "note.md")).toBe("LOCAL\n");
-    await state.engine.settle();
-    expect(decodeRecord(kv.get("f.a-remote")!.value).content).toBe("LOCAL\n");
-    expect((await state.store.getConflict("path-collision-op") as LifecycleRecord).lifecycle).toBe("resolved");
+    expect(text(state.vault, "note.md")).toBe("REMOTE\n");
+    expect(decodeRecord(kv.get("f.a-remote")!.value).content).toBe("REMOTE\n");
+    expect(text(state.vault, "note.conflict-copy.md")).toBe("LOCAL\n");
     await close(state);
   });
 
@@ -624,26 +619,27 @@ describe("durable conflict lifecycle contracts", () => {
   it("returns a raced resolution to review without overwriting the new remote version", async () => {
     const kv = new NatsKvDouble();
     const state = await replica("resolution-race", kv, "CANONICAL\n");
+    const fileId = (await state.store.getFileByPath("note.md"))!.fileId;
     state.engine.stop();
-    kv.create("f.remote", encodeRecord(remote("remote", "note.md", "REMOTE\n")));
+    kv.put(`f.${fileId}`, encodeRecord(remote(fileId, "note.md", "REMOTE\n")));
     state.vault.write("note.conflict.md", bytes("LOCAL WINNER\n"));
-    await state.store.putConflict({ operationId: "resolution-race-op", originalFileId: "remote", originalPath: "note.md", copyFileId: "copy",
-      copyPath: "note.conflict.md", remoteRevision: kv.get("f.remote")!.revision, lifecycle: "unresolved", context: "merge",
+    await state.store.putConflict({ operationId: "resolution-race-op", originalFileId: fileId, originalPath: "note.md", copyFileId: "copy",
+      copyPath: "note.conflict.md", remoteRevision: kv.get(`f.${fileId}`)!.revision, lifecycle: "unresolved", context: "merge",
       canonicalPath: "note.md", remotePath: "note.md", detectionRemoteHash: sha256Hex(bytes("REMOTE\n")),
       detectionLocalHash: sha256Hex(bytes("CANONICAL\n")), detectionCopyHash: sha256Hex(bytes("LOCAL WINNER\n")) } as unknown as ConflictRecord);
     const originalUpdate = kv.update.bind(kv);
     let raced = false;
     kv.update = (key, value, revision) => {
-      if (!raced) {
+      if (key.startsWith("f.") && !raced) {
         raced = true;
-        kv.put(key, encodeRecord(remote("remote", "note.md", "REMOTE RACE\n")));
+        kv.put(key, encodeRecord(remote(fileId, "note.md", "REMOTE RACE\n")));
       }
       return originalUpdate(key, value, revision);
     };
     await (state.engine as ResolutionEngine).keepLocalCopy("resolution-race-op");
     await state.engine.settle();
     expect(raced).toBe(true);
-    expect(decodeRecord(kv.get("f.remote")!.value).content).toBe("REMOTE RACE\n");
+    expect(decodeRecord(kv.get(`f.${fileId}`)!.value).content).toBe("REMOTE RACE\n");
     expect((await state.store.getConflict("resolution-race-op") as LifecycleRecord).lifecycle).toBe("unresolved");
     expect(await state.store.pending()).toHaveLength(0);
     await close(state);
