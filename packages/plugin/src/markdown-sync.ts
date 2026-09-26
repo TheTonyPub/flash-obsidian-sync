@@ -268,20 +268,32 @@ export class MarkdownSyncEngine {
     const remote = decodeRecord(head.value);
     const path = record.canonicalPath ?? record.originalPath;
     const local = await this.options.vault.read(path);
-    if (record.remoteRevision !== undefined && head.revision !== record.remoteRevision) throw new Error("Remote changed; refresh conflict review");
-    if (!local || sha256Hex(local) !== remote.contentHash) {
-      const deleted = !local;
-      await this.options.store.queue({ operationId: `resolve-${operationId}`, fileId: record.originalFileId,
-        type: deleted ? "delete" : "modify", path, localHash: local ? sha256Hex(local) : remote.contentHash,
-        content: local && path.endsWith(".md") ? new TextDecoder().decode(local) : undefined,
-        bytes: local && !path.endsWith(".md") ? local : undefined, kind: local && !path.endsWith(".md") ? "blob" : "text",
-        baseRevision: head.revision, baseHash: remote.contentHash, retryCount: 0, createdAt: Date.now() });
-      await this.options.store.updateConflict(operationId, { lifecycle: "pending-sync" });
-      await this.options.store.appendConflictHistory({ operationId, event: "pending", outcome: deleted ? "manual-delete" : "manual-edit" });
-    } else {
+    if (!remote.deleted && remote.path === path && local && sha256Hex(local) === remote.contentHash) {
       await this.options.store.updateConflict(operationId, { lifecycle: "resolved" });
       await this.options.store.appendConflictHistory({ operationId, event: "resolved", outcome: "manual-match" });
+      await this.refreshConflicts();
+      return;
     }
+    if (record.remoteRevision !== undefined && head.revision !== record.remoteRevision) {
+      // Older incoming-collision records captured the path before the losing identity moved.
+      const expectedRemotePath = record.context === "path-collision" &&
+        record.copyFileId === record.originalFileId && record.remotePath === record.originalPath
+        ? record.copyPath : record.remotePath;
+      const deletionMatches = record.detectionRemoteDeleted === undefined
+        ? !remote.deleted : remote.deleted === record.detectionRemoteDeleted;
+      const sameSnapshot = !!record.detectionRemoteHash && remote.contentHash === record.detectionRemoteHash &&
+        expectedRemotePath !== undefined && remote.path === expectedRemotePath && deletionMatches &&
+        (!record.kind || remote.kind === record.kind);
+      if (!sameSnapshot) throw new Error("Remote changed; refresh conflict review");
+    }
+    const deleted = !local;
+    await this.options.store.queue({ operationId: `resolve-${operationId}`, fileId: record.originalFileId,
+      type: deleted ? "delete" : "modify", path, localHash: local ? sha256Hex(local) : remote.contentHash,
+      content: local && path.endsWith(".md") ? new TextDecoder().decode(local) : undefined,
+      bytes: local && !path.endsWith(".md") ? local : undefined, kind: local && !path.endsWith(".md") ? "blob" : "text",
+      baseRevision: head.revision, baseHash: remote.contentHash, retryCount: 0, createdAt: Date.now() });
+    await this.options.store.updateConflict(operationId, { lifecycle: "pending-sync" });
+    await this.options.store.appendConflictHistory({ operationId, event: "pending", outcome: deleted ? "manual-delete" : "manual-edit" });
     await this.refreshConflicts();
     void this.replayPending().catch((error: unknown) => this.backgroundError("resolution.publish_failed", error));
   }
@@ -302,7 +314,10 @@ export class MarkdownSyncEngine {
     const canonical = await this.options.vault.read(path);
     if (record.remoteRevision !== undefined && head.revision !== record.remoteRevision) throw new Error("Remote changed; refresh conflict review");
     if (record.detectionRemoteHash && remote.contentHash !== record.detectionRemoteHash) throw new Error("Remote content changed; refresh conflict review");
-    if (record.detectionLocalHash && (!canonical || sha256Hex(canonical) !== record.detectionLocalHash)) {
+    const canonicalChanged = record.context === "path-collision"
+      ? (remote.deleted ? !!canonical : !canonical || sha256Hex(canonical) !== remote.contentHash)
+      : !!record.detectionLocalHash && (!canonical || sha256Hex(canonical) !== record.detectionLocalHash);
+    if (canonicalChanged) {
       throw new Error("Canonical path changed; refresh conflict review");
     }
     return { record, remote, head, canonical };
@@ -519,7 +534,8 @@ export class MarkdownSyncEngine {
     await this.options.store.putConflict({ operationId, originalFileId: record.fileId, originalPath: record.path,
       copyFileId: conflictCopyId(record.fileId, operationId), copyPath: path, remoteRevision: (await this.options.kv.get(`f.${record.fileId}`))?.revision ?? 0,
       lifecycle: "unresolved", context: "bootstrap", canonicalPath: record.path, remotePath: record.path,
-      detectionRemoteHash: record.contentHash, detectionLocalHash: sha256Hex(bytes), detectionCopyHash: sha256Hex(bytes), kind: record.kind, size: record.size });
+      detectionRemoteHash: record.contentHash, detectionRemoteDeleted: record.deleted,
+      detectionLocalHash: sha256Hex(bytes), detectionCopyHash: sha256Hex(bytes), kind: record.kind, size: record.size });
     await this.options.store.appendConflictHistory({ operationId, event: "detected", context: "bootstrap", path });
     if (!existing) {
       this.applyGuards.set(path, sha256Hex(bytes));
@@ -536,7 +552,8 @@ export class MarkdownSyncEngine {
     await this.options.store.putConflict({ operationId, originalFileId: record.fileId, originalPath: record.path,
       copyFileId: conflictCopyId(record.fileId, operationId), copyPath: path, remoteRevision: (await this.options.kv.get(`f.${record.fileId}`))?.revision ?? 0,
       lifecycle: "unresolved", context: "bootstrap", canonicalPath: record.path, remotePath: record.path,
-      detectionRemoteHash: record.contentHash, detectionLocalHash: sha256Hex(bytes), detectionCopyHash: sha256Hex(bytes), kind: record.kind, size: record.size });
+      detectionRemoteHash: record.contentHash, detectionRemoteDeleted: record.deleted,
+      detectionLocalHash: sha256Hex(bytes), detectionCopyHash: sha256Hex(bytes), kind: record.kind, size: record.size });
     await this.options.store.appendConflictHistory({ operationId, event: "detected", context: "bootstrap", path });
     if (!existing) {
       this.applyGuards.set(path, sha256Hex(bytes));
@@ -652,7 +669,7 @@ export class MarkdownSyncEngine {
   private async publishOne(operation: OutboxOperation): Promise<void> {
     if (operation.type === "delete") return this.publishDelete(operation);
     if (operation.type === "rename") return this.publishRename(operation);
-    const { kv, vault } = this.options;
+    const { kv, store, vault } = this.options;
     const key = `f.${operation.fileId}`;
     for (let attempt = 0; attempt < 3; attempt++) {
       const current = await kv.get(key);
@@ -672,6 +689,16 @@ export class MarkdownSyncEngine {
         await this.returnResolutionToReview(operation, "remote-revision-changed");
         return;
       }
+      const indexed = await store.getFile(operation.fileId);
+      const operationPath = normalizePath(operation.path);
+      const establishedSamePath = operation.type === "modify" &&
+        indexed?.fileId === operation.fileId && !indexed.deleted &&
+        normalizePath(indexed.path) === operationPath &&
+        remote?.fileId === operation.fileId && !remote.deleted &&
+        normalizePath(remote.path) === operationPath;
+      const path = establishedSamePath
+        ? remote!.path
+        : await this.resolveOutgoingPath(operation, remote?.path ?? operation.path);
       let content = localContent;
       if (current?.revision !== operation.baseRevision) {
         if (remote?.deleted) {
@@ -694,7 +721,6 @@ export class MarkdownSyncEngine {
         content = result.content;
       }
       const bytes = content === undefined ? operation.bytes! : new TextEncoder().encode(content);
-      const path = await this.resolveOutgoingPath(operation, remote?.path ?? operation.path);
       const common = {
         schemaVersion: 1, fileId: operation.fileId, path,
         deleted: false, contentHash: sha256Hex(bytes), size: bytes.length,
@@ -845,7 +871,8 @@ export class MarkdownSyncEngine {
     await store.putConflict({ operationId: operation.operationId, originalFileId: operation.fileId,
       originalPath: operation.path, copyFileId, copyPath, remoteRevision: revision, lifecycle: "unresolved", context: "merge",
       canonicalPath: remote.path, remotePath: remote.path, detectionRemoteHash: remote.contentHash,
-      detectionLocalHash: operation.localHash, detectionCopyHash: operation.localHash, kind: remote.kind, size: remote.size });
+      detectionRemoteDeleted: remote.deleted, detectionLocalHash: operation.localHash,
+      detectionCopyHash: operation.localHash, kind: remote.kind, size: remote.size });
     await store.appendConflictHistory({ operationId: operation.operationId, event: "detected", context: "merge", path: copyPath });
     status.conflictPaths = (await store.unresolvedConflicts()).map((item) => item.copyPath);
     status.conflicts = status.conflictPaths.length;
@@ -882,7 +909,8 @@ export class MarkdownSyncEngine {
     await store.putConflict({ operationId: operation.operationId, originalFileId: operation.fileId,
       originalPath: remote.path, copyFileId, copyPath, remoteRevision: revision, lifecycle: "unresolved", context: "merge",
       canonicalPath: remote.path, remotePath: remote.path, detectionRemoteHash: remote.contentHash,
-      detectionLocalHash: operation.localHash, detectionCopyHash: remote.contentHash, kind: remote.kind, size: remote.size });
+      detectionRemoteDeleted: remote.deleted, detectionLocalHash: operation.localHash,
+      detectionCopyHash: remote.contentHash, kind: remote.kind, size: remote.size });
     await store.appendConflictHistory({ operationId: operation.operationId, event: "detected", context: "merge", path: copyPath });
     status.conflictPaths = (await store.unresolvedConflicts()).map((item) => item.copyPath);
     status.conflicts = status.conflictPaths.length; status.refresh();
@@ -912,6 +940,7 @@ export class MarkdownSyncEngine {
       originalFileId: colliding.record.fileId, originalPath: path,
       copyFileId: operation.fileId, copyPath, remoteRevision: colliding.revision, lifecycle: "unresolved", context: "path-collision",
       canonicalPath: path, remotePath: colliding.record.path, detectionRemoteHash: colliding.record.contentHash,
+      detectionRemoteDeleted: colliding.record.deleted,
       detectionLocalHash: local ? sha256Hex(local) : undefined, detectionCopyHash: local ? sha256Hex(local) : undefined,
       kind: colliding.record.kind, size: colliding.record.size });
     await store.appendConflictHistory({ operationId: `path-${colliding.record.fileId}-${operation.fileId}`, event: "detected", context: "path-collision", path: copyPath });
@@ -1093,7 +1122,8 @@ export class MarkdownSyncEngine {
     const operationId = `path-${record.fileId < other.fileId ? record.fileId : other.fileId}-${loserId}`;
     await store.putConflict({ operationId, originalFileId: record.fileId, originalPath: record.path,
       copyFileId: loserId, copyPath, remoteRevision: revision, lifecycle: "unresolved", context: "path-collision",
-      canonicalPath: record.path, remotePath: record.path, detectionRemoteHash: record.contentHash,
+      canonicalPath: record.path, remotePath: loserId === record.fileId ? copyPath : record.path,
+      detectionRemoteHash: record.contentHash, detectionRemoteDeleted: record.deleted,
       detectionLocalHash: other.localHash, detectionCopyHash: other.localHash, kind: record.kind, size: record.size });
     await store.appendConflictHistory({ operationId, event: "detected", context: "path-collision", path: copyPath });
     status.conflictPaths = (await store.unresolvedConflicts()).map((item) => item.copyPath);

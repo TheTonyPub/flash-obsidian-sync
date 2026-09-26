@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeRecord } from "../../packages/protocol/src/index.js";
+import { decodeRecord, encodeRecord, sha256Hex } from "../../packages/protocol/src/index.js";
 import { MarkdownSyncEngine } from "../../packages/plugin/src/markdown-sync.js";
 import { LocalStore } from "../../packages/plugin/src/local-store.js";
 import { SyncStatus } from "../../packages/plugin/src/connection.js";
@@ -28,6 +28,177 @@ async function replica(deviceId: string, kv: NatsKvDouble) {
 }
 
 describe("inline Markdown sync", () => {
+  it("publishes repeated established same-path edits by CAS without listing the vault", async () => {
+    const kv = new NatsKvDouble();
+    const a = await replica("device-a", kv);
+    await a.engine.capture("notes/a.md", "initial");
+    const file = (await a.store.getFileByPath("notes/a.md"))!;
+    let listCalls = 0;
+    const list = kv.list.bind(kv);
+    kv.list = () => { listCalls++; return list(); };
+    const casRevisions: number[] = [];
+    const update = kv.update.bind(kv);
+    kv.update = ((key, value, revision) => {
+      casRevisions.push(revision);
+      return update(key, value, revision);
+    }) as typeof kv.update;
+
+    await a.engine.capture("notes/a.md", "edit one");
+    await a.engine.settle();
+    const first = kv.get(`f.${file.fileId}`)!;
+    expect(decodeRecord(first.value)).toMatchObject({ fileId: file.fileId, path: "notes/a.md", content: "edit one" });
+    await a.engine.capture("notes/a.md", "edit two");
+    await a.engine.settle();
+    const second = kv.get(`f.${file.fileId}`)!;
+
+    expect(decodeRecord(second.value)).toMatchObject({ fileId: file.fileId, path: "notes/a.md", content: "edit two" });
+    expect(casRevisions).toEqual([file.remoteRevision, first.revision]);
+    expect(listCalls).toBe(0);
+    expect(await a.store.pending()).toEqual([]);
+    a.engine.stop(); a.store.close();
+  });
+
+  it("checks path ownership before publishing a new file at an occupied path", async () => {
+    const kv = new NatsKvDouble();
+    const a = await replica("device-a", kv);
+    const remoteId = "remote-owner";
+    const remoteBytes = new TextEncoder().encode("remote");
+    kv.create(`f.${remoteId}`, encodeRecord({ schemaVersion: 1, fileId: remoteId, path: "notes/a.md", kind: "text",
+      deleted: false, contentHash: sha256Hex(remoteBytes), size: remoteBytes.length, content: "remote",
+      origin: { deviceId: "other", operationId: "remote-create", clientTime: 0 } }));
+    let listCalls = 0;
+    const list = kv.list.bind(kv);
+    kv.list = () => { listCalls++; return list(); };
+
+    await a.engine.capture("notes/a.md", "local");
+
+    const local = (await a.store.files()).find((entry) => entry.fileId !== remoteId)!;
+    expect(listCalls).toBeGreaterThan(0);
+    expect(decodeRecord(kv.get(`f.${remoteId}`)!.value).content).toBe("remote");
+    expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value).path).toBe(`notes/a.conflict-${local.fileId}.md`);
+    a.engine.stop(); a.store.close();
+  });
+
+  it("checks path ownership before publishing a rename into an occupied path", async () => {
+    const kv = new NatsKvDouble();
+    const a = await replica("device-a", kv);
+    await a.engine.capture("notes/source.md", "local");
+    const local = (await a.store.getFileByPath("notes/source.md"))!;
+    const remoteId = "remote-owner";
+    const remoteBytes = new TextEncoder().encode("remote");
+    kv.create(`f.${remoteId}`, encodeRecord({ schemaVersion: 1, fileId: remoteId, path: "notes/dest.md", kind: "text",
+      deleted: false, contentHash: sha256Hex(remoteBytes), size: remoteBytes.length, content: "remote",
+      origin: { deviceId: "other", operationId: "remote-create", clientTime: 0 } }));
+    let listCalls = 0;
+    const list = kv.list.bind(kv);
+    kv.list = () => { listCalls++; return list(); };
+
+    a.vault.rename("notes/source.md", "notes/dest.md");
+    await a.engine.rename("notes/source.md", "notes/dest.md");
+
+    expect(listCalls).toBeGreaterThan(0);
+    expect(decodeRecord(kv.get(`f.${remoteId}`)!.value).content).toBe("remote");
+    expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value).path).toBe(`notes/dest.conflict-${local.fileId}.md`);
+    a.engine.stop(); a.store.close();
+  });
+
+  it("checks the drifted remote destination before publishing a local edit", async () => {
+    const kv = new NatsKvDouble();
+    const a = await replica("device-a", kv);
+    await a.engine.capture("notes/a.md", "base");
+    const local = (await a.store.getFileByPath("notes/a.md"))!;
+    const current = kv.get(`f.${local.fileId}`)!;
+    const original = decodeRecord(current.value);
+    kv.update(`f.${local.fileId}`, encodeRecord({ ...original, path: "notes/moved.md" }), current.revision);
+    const remoteId = "remote-owner";
+    const remoteBytes = new TextEncoder().encode("remote");
+    kv.create(`f.${remoteId}`, encodeRecord({ schemaVersion: 1, fileId: remoteId, path: "notes/moved.md", kind: "text",
+      deleted: false, contentHash: sha256Hex(remoteBytes), size: remoteBytes.length, content: "remote",
+      origin: { deviceId: "other", operationId: "remote-create", clientTime: 0 } }));
+    let listCalls = 0;
+    const list = kv.list.bind(kv);
+    kv.list = () => { listCalls++; return list(); };
+
+    await a.engine.capture("notes/a.md", "edited");
+
+    expect(listCalls).toBeGreaterThan(0);
+    expect(decodeRecord(kv.get(`f.${remoteId}`)!.value).content).toBe("remote");
+    expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value).path).toBe(`notes/moved.conflict-${local.fileId}.md`);
+    a.engine.stop(); a.store.close();
+  });
+
+  it("checks the remote path when the local index has drifted", async () => {
+    const kv = new NatsKvDouble();
+    const a = await replica("device-a", kv);
+    await a.engine.capture("notes/a.md", "base");
+    const local = (await a.store.getFileByPath("notes/a.md"))!;
+    a.vault.rename("notes/a.md", "notes/moved.md");
+    a.vault.files.set("notes/moved.md", new TextEncoder().encode("edited"));
+    await a.store.putFile({ ...local, path: "notes/moved.md" });
+    let listCalls = 0;
+    const list = kv.list.bind(kv);
+    kv.list = () => { listCalls++; return list(); };
+
+    await a.engine.capture("notes/moved.md", "edited");
+
+    expect(listCalls).toBeGreaterThan(0);
+    expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value)).toMatchObject({ path: "notes/a.md", content: "edited" });
+    expect(text(a.vault, "notes/a.md")).toBe("edited");
+    expect(await a.store.pending()).toEqual([]);
+    a.engine.stop(); a.store.close();
+  });
+
+  it("checks the path when the indexed file's remote record is missing", async () => {
+    const kv = new NatsKvDouble();
+    kv.watch = () => () => {};
+    const a = await replica("device-a", kv);
+    await a.engine.capture("notes/a.md", "base");
+    const local = (await a.store.getFileByPath("notes/a.md"))!;
+    const remoteId = "remote-owner";
+    const remoteBytes = new TextEncoder().encode("remote");
+    kv.create(`f.${remoteId}`, encodeRecord({ schemaVersion: 1, fileId: remoteId, path: "notes/a.md", kind: "text",
+      deleted: false, contentHash: sha256Hex(remoteBytes), size: remoteBytes.length, content: "remote",
+      origin: { deviceId: "other", operationId: "remote-create", clientTime: 0 } }));
+    const get = kv.get.bind(kv);
+    kv.get = (key) => key === `f.${local.fileId}` ? null : get(key);
+    let listCalls = 0;
+    const list = kv.list.bind(kv);
+    kv.list = () => { listCalls++; return list().filter((entry) => entry.key !== `f.${local.fileId}`); };
+
+    a.vault.files.set("notes/a.md", new TextEncoder().encode("edited"));
+    await a.engine.capture("notes/a.md", "edited");
+
+    expect(listCalls).toBeGreaterThan(0);
+    expect(decodeRecord(kv.get(`f.${remoteId}`)!.value).content).toBe("remote");
+    expect(text(a.vault, `notes/a.conflict-${local.fileId}.md`)).toBe("edited");
+    expect(await a.store.pending()).toHaveLength(1);
+    a.engine.stop(); a.store.close();
+  });
+
+  it("preserves the local edit when its indexed remote identity is tombstoned", async () => {
+    const kv = new NatsKvDouble();
+    const a = await replica("device-a", kv);
+    await a.engine.capture("notes/a.md", "base");
+    const local = (await a.store.getFileByPath("notes/a.md"))!;
+    const current = kv.get(`f.${local.fileId}`)!;
+    const previous = decodeRecord(current.value);
+    kv.update(`f.${local.fileId}`, new TextEncoder().encode(JSON.stringify({
+      ...previous, deleted: true, content: undefined,
+    })), current.revision);
+    let listCalls = 0;
+    const list = kv.list.bind(kv);
+    kv.list = () => { listCalls++; return list(); };
+
+    await a.engine.capture("notes/a.md", "edited");
+
+    expect(listCalls).toBeGreaterThan(0);
+    expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value).deleted).toBe(true);
+    const conflict = (await a.store.conflicts()).find((entry) => entry.originalFileId === local.fileId);
+    expect(conflict).toBeDefined();
+    expect(text(a.vault, conflict!.copyPath)).toBe("edited");
+    a.engine.stop(); a.store.close();
+  });
+
   it("propagates single-writer edits in both directions without echo", async () => {
     const kv = new NatsKvDouble();
     const a = await replica("device-a", kv);
