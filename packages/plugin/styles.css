@@ -226,8 +226,8 @@
 }
 
 .flash-sync-conflict-actions {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
   gap: var(--size-4-1);
   margin-top: var(--size-4-2);
 }
@@ -235,6 +235,7 @@
 .flash-sync-conflict-actions .setting-item {
   border: 0;
   padding: 0;
+  min-width: 0;
 }
 
 .flash-sync-conflict-actions .setting-item-info {
@@ -242,12 +243,15 @@
 }
 
 .flash-sync-conflict-actions .setting-item-control {
+  flex: 1 1 auto;
+  width: 100%;
   min-width: 0;
 }
 
 .flash-sync-conflict-actions button {
+  width: 100%;
   white-space: normal;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
 }
 
 @container (max-width: 600px) {

@@ -15,6 +15,7 @@ type LifecycleRecord = ConflictRecord & {
   canonicalPath: string;
   remotePath: string;
   detectionRemoteHash: string;
+  detectionRemoteDeleted?: boolean;
   detectionLocalHash: string;
   detectionCopyHash: string;
   recoveryBackup?: { path: string; hash: string; size: number };
@@ -138,6 +139,7 @@ describe("durable conflict lifecycle contracts", () => {
     const pathRecord = records.find((record) => record.originalPath === "note.md")!;
     expect(pathRecord.context).toBe("path-collision");
     expect(pathRecord.copyPath.toLocaleLowerCase()).not.toBe(pathRecord.originalPath.toLocaleLowerCase());
+    expect(pathRecord.remotePath).toBe(pathRecord.copyFileId === pathRecord.originalFileId ? pathRecord.copyPath : pathRecord.originalPath);
     expect(pathRecord.lifecycle).toBe("unresolved");
     await close(state);
 
@@ -371,6 +373,161 @@ describe("durable conflict lifecycle contracts", () => {
     }
   });
 
+  it("allows marking resolved after a same-content remote revision bump", async () => {
+    const kv = new NatsKvDouble();
+    const state = await replica("manual-same-content-revision", kv, "MANUAL EDIT\n");
+    state.engine.stop();
+    const original = remote("remote", "note.md", "REMOTE\n");
+    const detectedRevision = kv.create("f.remote", encodeRecord(original));
+    await state.store.putConflict({ operationId: "manual-same-content-revision-op", originalFileId: "remote",
+      originalPath: "note.md", copyFileId: "copy", copyPath: "note.conflict.md", remoteRevision: detectedRevision,
+      lifecycle: "unresolved", context: "merge", canonicalPath: "note.md", remotePath: "note.md",
+      detectionRemoteHash: original.contentHash, detectionLocalHash: original.contentHash,
+    } as unknown as ConflictRecord);
+
+    kv.put("f.remote", encodeRecord(original));
+    await (state.engine as ResolutionEngine).markResolved("manual-same-content-revision-op");
+    await state.engine.settle();
+
+    expect((await state.store.getConflict("manual-same-content-revision-op") as LifecycleRecord).lifecycle).toBe("resolved");
+    expect(await state.store.pending()).toHaveLength(0);
+    expect(decodeRecord(kv.get("f.remote")!.value).content).toBe("MANUAL EDIT\n");
+    await close(state);
+  });
+
+  it("keeps changed remote content or path blocked after a revision bump", async () => {
+    for (const changedRemote of [remote("remote", "note.md", "NEW REMOTE\n"), remote("remote", "renamed.md", "REMOTE\n")]) {
+      const kv = new NatsKvDouble();
+      const state = await replica(`manual-changed-revision-${crypto.randomUUID()}`, kv, "MANUAL EDIT\n");
+      state.engine.stop();
+      const original = remote("remote", "note.md", "REMOTE\n");
+      const detectedRevision = kv.create("f.remote", encodeRecord(original));
+      const operationId = `manual-changed-revision-${crypto.randomUUID()}`;
+      await state.store.putConflict({ operationId, originalFileId: "remote", originalPath: "note.md", copyFileId: "copy",
+        copyPath: "note.conflict.md", remoteRevision: detectedRevision, lifecycle: "unresolved", context: "merge",
+        canonicalPath: "note.md", remotePath: "note.md", detectionRemoteHash: original.contentHash,
+        detectionRemoteDeleted: false, kind: original.kind,
+      } as unknown as ConflictRecord);
+
+      kv.put("f.remote", encodeRecord(changedRemote));
+      await expect((state.engine as ResolutionEngine).markResolved(operationId)).rejects.toThrow("Remote changed; refresh conflict review");
+      expect((await state.store.getConflict(operationId) as LifecycleRecord).lifecycle).toBe("unresolved");
+      expect(await state.store.pending()).toHaveLength(0);
+      await close(state);
+    }
+  });
+
+  it("blocks marking resolved when a tombstone changes to live at a newer revision", async () => {
+    const kv = new NatsKvDouble();
+    const state = await replica("manual-tombstone-revision", kv);
+    state.engine.stop();
+    const original = remote("remote", "note.md", "REMOTE\n");
+    const tombstone: RemoteFileRecord = { ...original, deleted: true, content: undefined, size: 0,
+      deletion: { reason: "manual" }, origin: { ...original.origin, operationId: "remote-delete" } };
+    const detectedRevision = kv.create("f.remote", encodeRecord(tombstone));
+    await state.store.putConflict({ operationId: "manual-tombstone-revision-op", originalFileId: "remote",
+      originalPath: "note.md", copyFileId: "copy", copyPath: "note.conflict.md", remoteRevision: detectedRevision,
+      lifecycle: "unresolved", context: "merge", canonicalPath: "note.md", remotePath: "note.md",
+      detectionRemoteHash: original.contentHash, detectionRemoteDeleted: true, kind: original.kind,
+    } as unknown as ConflictRecord);
+
+    kv.put("f.remote", encodeRecord(original));
+    await expect((state.engine as ResolutionEngine).markResolved("manual-tombstone-revision-op"))
+      .rejects.toThrow("Remote changed; refresh conflict review");
+
+    expect((await state.store.getConflict("manual-tombstone-revision-op") as LifecycleRecord).lifecycle).toBe("unresolved");
+    expect(await state.store.pending()).toHaveLength(0);
+    await close(state);
+  });
+
+  it("does not assume a legacy conflict snapshot represents a tombstone", async () => {
+    const kv = new NatsKvDouble();
+    const state = await replica("legacy-tombstone-revision", kv);
+    state.engine.stop();
+    const original = remote("remote", "note.md", "REMOTE\n");
+    const tombstone: RemoteFileRecord = { ...original, deleted: true, content: undefined, size: 0,
+      deletion: { reason: "manual" }, origin: { ...original.origin, operationId: "remote-delete" } };
+    const detectedRevision = kv.create("f.remote", encodeRecord(tombstone));
+    await state.store.putConflict({ operationId: "legacy-tombstone-revision-op", originalFileId: "remote",
+      originalPath: "note.md", copyFileId: "copy", copyPath: "note.conflict.md", remoteRevision: detectedRevision,
+      lifecycle: "unresolved", context: "merge", canonicalPath: "note.md", remotePath: "note.md",
+      detectionRemoteHash: original.contentHash, kind: original.kind,
+    } as unknown as ConflictRecord);
+
+    kv.put("f.remote", encodeRecord(tombstone));
+    await expect((state.engine as ResolutionEngine).markResolved("legacy-tombstone-revision-op"))
+      .rejects.toThrow("Remote changed; refresh conflict review");
+
+    expect((await state.store.getConflict("legacy-tombstone-revision-op") as LifecycleRecord).lifecycle).toBe("unresolved");
+    expect(await state.store.pending()).toHaveLength(0);
+    await close(state);
+  });
+
+  it("resolves a missing-copy conflict without writing when canonical matches the live remote head", async () => {
+    const kv = new NatsKvDouble();
+    const state = await replica("missing-copy-current-match", kv, "CURRENT\n");
+    state.engine.stop();
+    const detected = remote("remote", "note.md", "DETECTED\n");
+    const detectedRevision = kv.create("f.remote", encodeRecord(detected));
+    await state.store.putConflict({ operationId: "missing-copy-current-match-op", originalFileId: "remote",
+      originalPath: "note.md", copyFileId: "copy", copyPath: "note.conflict.md", remoteRevision: detectedRevision,
+      lifecycle: "unresolved", context: "merge", canonicalPath: "note.md", remotePath: "note.md",
+      detectionRemoteHash: detected.contentHash, detectionRemoteDeleted: false,
+    } as unknown as ConflictRecord);
+    const current = remote("remote", "note.md", "CURRENT\n");
+    kv.put("f.remote", encodeRecord(current));
+    state.vault.write("note.conflict.md", bytes("PRESERVED\n"));
+    state.vault.delete("note.conflict.md");
+
+    let writes = 0;
+    const originalPut = kv.put.bind(kv);
+    const originalUpdate = kv.update.bind(kv);
+    kv.put = (key, value, revision) => { writes++; return originalPut(key, value, revision); };
+    kv.update = (key, value, revision) => { writes++; return originalUpdate(key, value, revision); };
+    await (state.engine as ResolutionEngine).markResolved("missing-copy-current-match-op");
+
+    expect((await state.store.getConflict("missing-copy-current-match-op") as LifecycleRecord).lifecycle).toBe("resolved");
+    expect(await state.store.pending()).toHaveLength(0);
+    expect(writes).toBe(0);
+    expect(text(state.vault, "note.md")).toBe("CURRENT\n");
+    await close(state);
+  });
+
+  it("blocks stale conflict no-ops after canonical, remote path, or tombstone state changes", async () => {
+    const cases = [
+      { name: "canonical-differs", canonical: "MANUAL\n", current: remote("remote", "note.md", "CURRENT\n") },
+      { name: "remote-path-drift", canonical: "CURRENT\n", current: remote("remote", "renamed.md", "CURRENT\n") },
+      { name: "remote-tombstone", canonical: "CURRENT\n", current: {
+        ...remote("remote", "note.md", "CURRENT\n"), deleted: true, content: undefined, size: 0,
+        deletion: { reason: "manual" }, origin: { deviceId: "remote-device", operationId: "remote-delete", clientTime: 2 },
+      } as RemoteFileRecord },
+    ];
+    for (const scenario of cases) {
+      const kv = new NatsKvDouble();
+      const state = await replica(`missing-copy-${scenario.name}`, kv, scenario.canonical);
+      state.engine.stop();
+      const detected = remote("remote", "note.md", "DETECTED\n");
+      const detectedRevision = kv.create("f.remote", encodeRecord(detected));
+      const operationId = `missing-copy-${scenario.name}-op`;
+      await state.store.putConflict({ operationId, originalFileId: "remote", originalPath: "note.md",
+        copyFileId: "copy", copyPath: "note.conflict.md", remoteRevision: detectedRevision,
+        lifecycle: "unresolved", context: "merge", canonicalPath: "note.md", remotePath: "note.md",
+        detectionRemoteHash: detected.contentHash, detectionRemoteDeleted: false,
+      } as unknown as ConflictRecord);
+      kv.put("f.remote", encodeRecord(scenario.current));
+
+      await expect((state.engine as ResolutionEngine).markResolved(operationId))
+        .rejects.toThrow("Remote changed; refresh conflict review");
+      expect((await state.store.getConflict(operationId) as LifecycleRecord).lifecycle).toBe("unresolved");
+      expect(await state.store.pending()).toHaveLength(0);
+      expect(text(state.vault, "note.md")).toBe(scenario.canonical);
+      expect(decodeRecord(kv.get("f.remote")!.value)).toMatchObject({
+        contentHash: scenario.current.contentHash, path: scenario.current.path, deleted: scenario.current.deleted,
+      });
+      await close(state);
+    }
+  });
+
   it("blocks a changed remote revision while retaining the selected record", async () => {
     const kv = new NatsKvDouble();
     const state = await replica("guard", kv, "LOCAL\n");
@@ -420,6 +577,47 @@ describe("durable conflict lifecycle contracts", () => {
     await expect((state.engine as ResolutionEngine).keepLocalCopy("copy-guard-op")).rejects.toThrow();
     expect(text(state.vault, "note.md")).toBe("CANONICAL\n");
     expect((await state.store.getConflict("copy-guard-op") as LifecycleRecord).lifecycle).toBe("unresolved");
+    await close(state);
+  });
+
+  it("keeps the preserved local version after an incoming path collision", async () => {
+    const kv = new NatsKvDouble();
+    const state = await replica("path-collision-local-action", kv, "REMOTE\n");
+    state.engine.stop();
+    kv.create("f.a-remote", encodeRecord(remote("a-remote", "note.md", "REMOTE\n")));
+    state.vault.write("note.conflict-copy.md", bytes("LOCAL\n"));
+    await state.store.putConflict({ operationId: "path-collision-op", originalFileId: "a-remote", originalPath: "note.md",
+      copyFileId: "z-local", copyPath: "note.conflict-copy.md", remoteRevision: kv.get("f.a-remote")!.revision,
+      lifecycle: "unresolved", context: "path-collision", canonicalPath: "note.md", remotePath: "note.md",
+      detectionRemoteHash: sha256Hex(bytes("REMOTE\n")), detectionLocalHash: sha256Hex(bytes("LOCAL\n")),
+      detectionCopyHash: sha256Hex(bytes("LOCAL\n")),
+    } as unknown as ConflictRecord);
+
+    await (state.engine as ResolutionEngine).keepLocalCopy("path-collision-op");
+
+    expect(text(state.vault, "note.md")).toBe("LOCAL\n");
+    await state.engine.settle();
+    expect(decodeRecord(kv.get("f.a-remote")!.value).content).toBe("LOCAL\n");
+    expect((await state.store.getConflict("path-collision-op") as LifecycleRecord).lifecycle).toBe("resolved");
+    await close(state);
+  });
+
+  it("blocks path-collision resolution when the canonical remote version has changed locally", async () => {
+    const kv = new NatsKvDouble();
+    const state = await replica("path-collision-canonical-guard", kv, "UNEXPECTED\n");
+    state.engine.stop();
+    kv.create("f.a-remote", encodeRecord(remote("a-remote", "note.md", "REMOTE\n")));
+    state.vault.write("note.conflict-copy.md", bytes("LOCAL\n"));
+    await state.store.putConflict({ operationId: "path-collision-guard-op", originalFileId: "a-remote", originalPath: "note.md",
+      copyFileId: "z-local", copyPath: "note.conflict-copy.md", remoteRevision: kv.get("f.a-remote")!.revision,
+      lifecycle: "unresolved", context: "path-collision", canonicalPath: "note.md", remotePath: "note.md",
+      detectionRemoteHash: sha256Hex(bytes("REMOTE\n")), detectionLocalHash: sha256Hex(bytes("LOCAL\n")),
+      detectionCopyHash: sha256Hex(bytes("LOCAL\n")),
+    } as unknown as ConflictRecord);
+
+    await expect((state.engine as ResolutionEngine).keepLocalCopy("path-collision-guard-op")).rejects.toThrow("Canonical path changed");
+    expect(text(state.vault, "note.md")).toBe("UNEXPECTED\n");
+    expect((await state.store.getConflict("path-collision-guard-op") as LifecycleRecord).lifecycle).toBe("unresolved");
     await close(state);
   });
 

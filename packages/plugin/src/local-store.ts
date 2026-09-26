@@ -44,6 +44,7 @@ export interface ConflictRecord {
   canonicalPath?: string;
   remotePath?: string;
   detectionRemoteHash?: string;
+  detectionRemoteDeleted?: boolean;
   detectionLocalHash?: string;
   detectionCopyHash?: string;
   kind?: "text" | "blob";
