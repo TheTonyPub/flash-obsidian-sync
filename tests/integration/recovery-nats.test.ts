@@ -35,13 +35,14 @@ async function eventually(check: () => Promise<boolean> | boolean): Promise<void
 }
 
 describe("NATS persistence and offline recovery", () => {
-  it("bootstraps, retains offline edit, and catches up after server restart", async () => {
+  it("bootstraps, retains offline edit, and catches up after restart or client reconnect", async () => {
     const executable = process.env.NATS_SERVER_BIN;
     const docker = process.env.NATS_TEST_DOCKER === "1";
-    if (!executable && !docker) throw new Error("Set NATS_SERVER_BIN or NATS_TEST_DOCKER=1");
+    const externalUrl = process.env.NATS_TEST_URL;
+    if (!executable && !docker && !externalUrl) throw new Error("Set NATS_SERVER_BIN, NATS_TEST_DOCKER=1, or NATS_TEST_URL");
     const directory = await mkdtemp(join(tmpdir(), "easy-sync-recovery-"));
-    const serverPort = await port();
-    const url = `nats://127.0.0.1:${serverPort}`;
+    const serverPort = externalUrl ? 0 : await port();
+    const url = externalUrl ?? `nats://127.0.0.1:${serverPort}`;
     let server: ChildProcess | undefined;
     let containerCreated = false;
     let containerRunning = false;
@@ -51,7 +52,10 @@ describe("NATS persistence and offline recovery", () => {
     const stores: LocalStore[] = [];
 
     async function launch(): Promise<NatsConnection> {
-      if (docker) {
+      if (externalUrl) {
+        // A separately managed disposable server stays alive; this exercises
+        // fresh client connections without changing its lifecycle.
+      } else if (docker) {
         if (containerCreated) execFileSync("docker", ["start", containerName]);
         else {
           execFileSync("docker", ["run", "-d", "--name", containerName,
@@ -74,6 +78,7 @@ describe("NATS persistence and offline recovery", () => {
     }
 
     async function shutdown(): Promise<void> {
+      if (externalUrl) return;
       if (docker) {
         if (containerRunning) execFileSync("docker", ["stop", containerName]);
         containerRunning = false;

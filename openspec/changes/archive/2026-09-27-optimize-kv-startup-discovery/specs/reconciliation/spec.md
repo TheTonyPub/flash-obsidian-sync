@@ -5,7 +5,7 @@ Defines complete and race-safe remote-state discovery for a vault when synchroni
 ## ADDED Requirements
 
 ### Requirement: Complete remote snapshot begins live synchronization
-For each startup or reconnect reconciliation, the plugin SHALL obtain every current record, including tombstones, from the configured vault bucket before it reports reconciliation complete. The primary discovery path SHALL use one subscription that supplies the current snapshot and then continues to deliver live changes, without a gap between the discovered state and live delivery.
+For each startup or reconnect reconciliation, the plugin SHALL obtain every current record, including tombstones, from the configured vault bucket before it reports reconciliation complete. The primary discovery path SHALL use one ephemeral pull-consumer session that supplies the current snapshot and then continues to deliver live changes, without a gap between the discovered state and live delivery.
 
 #### Scenario: Nonempty bucket starts from a complete snapshot
 - **WHEN** a client starts synchronization for a vault containing current live records and tombstones
@@ -41,7 +41,7 @@ Remote discovery SHALL retain the existing identity-scoped handling of tombstone
 If the primary discovery path cannot establish a complete snapshot or loses the required completion signal, the plugin SHALL retain local state and pending operations, use the existing complete remote-discovery fallback before replaying pending work, and expose the recoverable condition through local diagnostics. It SHALL not report `SYNCED` until either discovery path has completed.
 
 #### Scenario: Snapshot completion cannot be established
-- **WHEN** the primary discovery subscription fails before the client can establish a complete snapshot
+- **WHEN** the primary discovery session fails before the client can establish a complete snapshot
 - **THEN** the client records a diagnostic, completes reconciliation through the fallback or remains unsynchronized on fallback failure, and preserves its local outbox
 
 #### Scenario: Mobile resume loses the connection

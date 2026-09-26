@@ -4,11 +4,11 @@ Startup and reconnect reconciliation currently enumerates KV names and then fetc
 
 ## What Changes
 
-- Replace reconciliation's vault-wide `kv.keys()` plus per-key reads with one NATS KV `LastValue` watch that supplies the complete current-state snapshot and then continues as the live watch.
+- Replace reconciliation's vault-wide `kv.keys()` plus per-key reads with one ephemeral JetStream `LastPerSubject` pull consumer that supplies the complete current-state snapshot and then continues live delivery.
 - Define an explicit completion barrier for both nonempty and empty buckets using a stable public JetStream consumer signal, because the installed KV watch API does not expose an empty-snapshot completion event.
 - Preserve events arriving during snapshot intake, process each revision idempotently, and avoid a snapshot-to-live gap or duplicate remote application.
 - Preserve identity-scoped tombstone, remote path-ownership, `recoverPathReuse`, local IndexedDB outbox, CAS, and conflict behavior while applying the discovered snapshot.
-- Fall back safely to the existing complete-list discovery path if the watch snapshot or its completion barrier cannot be established; surface diagnostic metrics and a repeatable benchmark without promising a fixed speedup.
+- Fall back safely to the existing complete-list discovery path if the pull snapshot or its completion barrier cannot be established; surface diagnostic metrics and a repeatable benchmark without promising a fixed speedup.
 - Keep inline Markdown, optional S3 blob handling, existing per-vault bucket permissions, and user-owned server operations unchanged.
 
 ## Capabilities
@@ -19,7 +19,7 @@ Startup and reconnect reconciliation currently enumerates KV names and then fetc
 
 ### Modified Capabilities
 
-- `realtime-sync-core`: Defines truthful convergence when snapshot discovery completes through the primary watch path or its safe fallback.
+- `realtime-sync-core`: Defines truthful convergence when snapshot discovery completes through the primary pull path or its safe fallback.
 
 ## Impact
 
