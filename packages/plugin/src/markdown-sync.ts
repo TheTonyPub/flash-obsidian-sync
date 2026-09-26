@@ -1,4 +1,7 @@
-import { createFileId, decodeRecord, encodeRecord, normalizePath, sha256Hex, type RemoteFileRecord } from "@flash-osidian-sync/protocol";
+import {
+  canonicalizeRemotePath, createFileId, decodePathOwnershipRecord, decodeRecord, encodePathOwnershipRecord,
+  encodeRecord, normalizePath, pathOwnershipKey, sha256Hex, type PathOwnershipRecord, type RemoteFileRecord,
+} from "@flash-osidian-sync/protocol";
 import { type KvPort, type SyncStatus } from "./connection.js";
 import { type ConflictRecord, type FileIndexEntry, type LocalStore, type OutboxOperation } from "./local-store.js";
 import { conflictCopyId, conflictCopyPath, resolveMarkdown } from "./conflict-resolution.js";
@@ -407,6 +410,7 @@ export class MarkdownSyncEngine {
       const watchSetupStartedAt = performance.now();
       this.stopWatch?.();
       this.stopWatch = await kv.watch((entry) => {
+        if (!entry.key.startsWith("f.")) return;
         if (this.buffering) this.buffered.push(entry);
         else this.queueLive(entry);
       });
@@ -423,7 +427,7 @@ export class MarkdownSyncEngine {
       localScanMs = Math.round(performance.now() - localScanStartedAt);
       stage = "remote_list";
       const remoteListStartedAt = performance.now();
-      const remote = (await kv.list()).sort((left, right) => {
+      const remote = (await kv.list()).filter((entry) => entry.key.startsWith("f.")).sort((left, right) => {
         try {
           return Number(decodeRecord(right.value).deleted) - Number(decodeRecord(left.value).deleted);
         } catch { return 0; }
@@ -645,9 +649,9 @@ export class MarkdownSyncEngine {
         }
       } catch (error) {
         status.lastError = errorSummary(error);
+        blockedFiles.add(operation.fileId);
         if (error instanceof BlobStorageUnavailableError) {
           status.markError(`outbox:${operation.fileId}`);
-          blockedFiles.add(operation.fileId);
           continue;
         }
         this.options.logger?.error("outbox.publish_failed", error, { operationType: operation.type, retryCount: operation.retryCount });
@@ -676,12 +680,14 @@ export class MarkdownSyncEngine {
       const remote = current ? decodeRecord(current.value) : undefined;
       const localContent = operation.content;
       if (remote?.origin.operationId === operation.operationId && remote.contentHash === operation.localHash) {
+        await this.completePathChange(operation, remote, operation.basePath ?? remote.path);
         await this.acknowledge(operation, remote, current!.revision);
         return;
       }
       // A remote write can contain the exact bytes we intend to publish while using
       // a different representation. There is no divergence to preserve as a conflict.
-      if (remote && !remote.deleted && remote.contentHash === operation.localHash) {
+      if (remote && !remote.deleted && remote.contentHash === operation.localHash && remote.path === operation.path) {
+        await this.completePathChange(operation, remote, operation.basePath ?? remote.path);
         await this.acknowledge(operation, remote, current!.revision);
         return;
       }
@@ -696,9 +702,11 @@ export class MarkdownSyncEngine {
         normalizePath(indexed.path) === operationPath &&
         remote?.fileId === operation.fileId && !remote.deleted &&
         normalizePath(remote.path) === operationPath;
-      const path = establishedSamePath
+      const resolvedPath = establishedSamePath
         ? remote!.path
         : await this.resolveOutgoingPath(operation, remote?.path ?? operation.path);
+      if (!resolvedPath) { await store.confirm(operation.operationId); return; }
+      const path = resolvedPath;
       let content = localContent;
       if (current?.revision !== operation.baseRevision) {
         if (remote?.deleted) {
@@ -720,6 +728,11 @@ export class MarkdownSyncEngine {
         }
         content = result.content;
       }
+      try { await this.reservePath(operation.fileId, operation.operationId, path); }
+      catch (error) {
+        if (error instanceof Error && error.message.startsWith("Path ownership collision:")) continue;
+        throw error;
+      }
       const bytes = content === undefined ? operation.bytes! : new TextEncoder().encode(content);
       const common = {
         schemaVersion: 1, fileId: operation.fileId, path,
@@ -730,7 +743,7 @@ export class MarkdownSyncEngine {
       const inline: RemoteFileRecord = { ...common, kind: "text", content: content ?? "" };
       const limit = Math.max(1, Math.min(this.options.inlineLimit ?? DEFAULT_INLINE_LIMIT,
         (kv.maxValueBytes ?? Number.POSITIVE_INFINITY) - 1024));
-      const useBlob = chooseStorage(path, bytes, limit) === "blob" || encodeRecord(inline).length > limit;
+      const useBlob = chooseStorage(path.toLowerCase(), bytes, limit) === "blob" || encodeRecord(inline).length > limit;
       let record: RemoteFileRecord;
       if (useBlob) {
         const blob = this.options.blob;
@@ -757,6 +770,7 @@ export class MarkdownSyncEngine {
         const revision = current
           ? await kv.update!(key, encodeRecord(record), current.revision)
           : await kv.create!(key, encodeRecord(record));
+        await this.completePathChange(operation, record, remote?.path ?? operation.basePath);
         if (content !== localContent && sha256Hex((await vault.read(path)) ?? new Uint8Array()) === operation.localHash) {
           this.applyGuards.set(path, record.contentHash);
           await vault.write(path, bytes);
@@ -766,6 +780,14 @@ export class MarkdownSyncEngine {
       } catch (error) {
         const latest = await kv.get(key);
         if (latest?.revision === current?.revision) throw error;
+        const latestRecord = latest && decodeRecord(latest.value);
+        if (latestRecord?.origin.operationId === operation.operationId && !latestRecord.deleted &&
+            canonicalizeRemotePath(latestRecord.path) === canonicalizeRemotePath(path)) {
+          await this.completePathChange(operation, latestRecord, remote?.path ?? operation.basePath);
+          await this.acknowledge(operation, latestRecord, latest!.revision);
+          return;
+        }
+        await this.releaseReservation(path, operation.fileId, operation.operationId);
       }
     }
     throw new Error("CAS retries exhausted");
@@ -779,6 +801,7 @@ export class MarkdownSyncEngine {
       if (!current) throw new Error("Rename base unavailable");
       const remote = decodeRecord(current.value);
       if (remote.origin.operationId === operation.operationId) {
+        await this.completePathChange(operation, remote, operation.basePath ?? remote.path);
         await this.acknowledge(operation, remote, current.revision); return;
       }
       if (remote.deleted || (current.revision !== operation.baseRevision &&
@@ -786,6 +809,7 @@ export class MarkdownSyncEngine {
         await this.preserveConflict(operation, remote, current.revision); return;
       }
       const path = await this.resolveOutgoingPath(operation, operation.path);
+      if (!path) return;
       let content = remote.content;
       if (remote.kind === "text" && remote.content !== undefined && operation.content !== undefined &&
         remote.contentHash !== operation.baseHash) {
@@ -801,12 +825,19 @@ export class MarkdownSyncEngine {
         origin: { deviceId: this.options.deviceId, operationId: operation.operationId, clientTime: Date.now() },
         basedOnRevision: current.revision };
       try {
+        await this.reservePath(operation.fileId, operation.operationId, path);
         const revision = await kv.update!(key, encodeRecord(record), current.revision);
+        await this.completePathChange(operation, record, remote.path);
         await this.acknowledge(operation, record, revision);
         return;
       } catch (error) {
         const latest = await kv.get(key);
         if (latest?.revision === current.revision) throw error;
+        const latestRecord = latest && decodeRecord(latest.value);
+        if (latestRecord?.origin.operationId !== operation.operationId || latestRecord.deleted ||
+            canonicalizeRemotePath(latestRecord.path) !== canonicalizeRemotePath(path)) {
+          await this.releaseReservation(path, operation.fileId, operation.operationId);
+        }
       }
     }
     throw new Error("Rename CAS retries exhausted");
@@ -820,6 +851,7 @@ export class MarkdownSyncEngine {
       if (!current) { await this.options.store.confirm(operation.operationId); return; }
       const remote = decodeRecord(current.value);
       if (remote.deleted && remote.origin.operationId === operation.operationId) {
+        await this.releasePath(remote.path, remote.fileId, operation.operationId);
         await this.acknowledge(operation, remote, current.revision); return;
       }
       if (operation.operationId.startsWith("resolve-") && current.revision !== operation.baseRevision) {
@@ -834,6 +866,7 @@ export class MarkdownSyncEngine {
         basedOnRevision: current.revision, deletion: { reason: "local delete" } };
       try {
         const revision = await kv.update!(key, encodeRecord(record), current.revision);
+        await this.releasePath(record.path, record.fileId, operation.operationId);
         await this.acknowledge(operation, record, revision);
         return;
       } catch (error) {
@@ -921,40 +954,179 @@ export class MarkdownSyncEngine {
     return `${path.slice(0, dot)}.conflict-${fileId}${path.slice(dot)}`;
   }
 
-  private async resolveOutgoingPath(operation: OutboxOperation, path: string): Promise<string> {
+  private async readPathOwner(path: string): Promise<{ key: string; record?: PathOwnershipRecord; revision?: number }> {
+    const key = pathOwnershipKey(path);
+    const entry = await this.options.kv.get(key);
+    return entry ? { key, record: decodePathOwnershipRecord(entry.value, key), revision: entry.revision } : { key };
+  }
+
+  private async writePathOwner(current: { key: string; record?: PathOwnershipRecord; revision?: number },
+    record: PathOwnershipRecord): Promise<number> {
+    const value = encodePathOwnershipRecord(record);
+    return current.revision === undefined
+      ? this.options.kv.create!(current.key, value)
+      : this.options.kv.update!(current.key, value, current.revision);
+  }
+
+  private async reservePath(fileId: string, operationId: string, path: string): Promise<void> {
+    const canonicalPath = canonicalizeRemotePath(path);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const current = await this.readPathOwner(path);
+      const owner = current.record;
+      if (owner?.state === "owned" && owner.fileId === fileId) return;
+      if (owner?.state === "reserved" && owner.fileId === fileId) {
+        if (owner.operationId === operationId) return;
+        const head = await this.options.kv.get(`f.${fileId}`);
+        if (head) {
+          const record = decodeRecord(head.value);
+          if (record.origin.operationId === owner.operationId && !record.deleted &&
+              canonicalizeRemotePath(record.path) === owner.canonicalPath) {
+            try {
+              await this.writePathOwner(current, { ...owner, state: "owned" });
+              return;
+            } catch { continue; }
+          }
+        }
+        this.options.status.lastError = `Path ${owner.canonicalPath} is reserved by operation ${owner.operationId}; reconnect its originating device to recover it.`;
+        this.options.status.refresh();
+        throw new Error(this.options.status.lastError);
+      }
+      if (owner?.state === "reserved" && owner.fileId !== fileId) {
+        throw new Error(`Path ownership collision: ${owner.canonicalPath} is reserved by operation ${owner.operationId}`);
+      }
+      if (owner?.state === "owned" && owner.fileId !== fileId) {
+        throw new Error(`Path ownership collision: ${owner.canonicalPath}`);
+      }
+      const reserved: PathOwnershipRecord = { schemaVersion: 1, canonicalPath, fileId, operationId, state: "reserved" };
+      try { await this.writePathOwner(current, reserved); return; }
+      catch { /* A peer changed this key: classify its latest value on the next pass. */ }
+    }
+    throw new Error(`Path reservation CAS retries exhausted for ${canonicalPath}`);
+  }
+
+  private async finalizePath(path: string, fileId: string, operationId: string): Promise<void> {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const current = await this.readPathOwner(path);
+      const owner = current.record;
+      if (owner?.state === "owned" && owner.fileId === fileId) return;
+      if (!owner || owner.state !== "reserved" || owner.fileId !== fileId || owner.operationId !== operationId) {
+        throw new Error(`Path reservation for ${canonicalizeRemotePath(path)} is unavailable during finalization`);
+      }
+      try { await this.writePathOwner(current, { ...owner, state: "owned" }); return; }
+      catch { /* Retry with the current KV revision. */ }
+    }
+    throw new Error(`Path ownership finalization retries exhausted for ${canonicalizeRemotePath(path)}`);
+  }
+
+  private async releaseReservation(path: string, fileId: string, operationId: string): Promise<void> {
+    const current = await this.readPathOwner(path);
+    const owner = current.record;
+    if (!owner || owner.state !== "reserved" || owner.fileId !== fileId || owner.operationId !== operationId) return;
+    await this.writePathOwner(current, { ...owner, state: "released" });
+  }
+
+  private async releasePath(path: string, fileId: string, operationId: string): Promise<void> {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const current = await this.readPathOwner(path);
+      const owner = current.record;
+      if (!owner || owner.state === "released" || owner.fileId !== fileId) return;
+      const released: PathOwnershipRecord = { ...owner, operationId, state: "released" };
+      try { await this.writePathOwner(current, released); return; }
+      catch { /* Retry with the current KV revision. */ }
+    }
+    throw new Error(`Path ownership release retries exhausted for ${canonicalizeRemotePath(path)}`);
+  }
+
+  private async completePathChange(operation: OutboxOperation, record: RemoteFileRecord, oldPath?: string): Promise<void> {
+    if (record.deleted) {
+      await this.releasePath(record.path, record.fileId, operation.operationId);
+      return;
+    }
+    await this.reservePath(record.fileId, operation.operationId, record.path);
+    await this.finalizePath(record.path, record.fileId, operation.operationId);
+    if (oldPath && pathOwnershipKey(oldPath) !== pathOwnershipKey(record.path)) {
+      await this.releasePath(oldPath, record.fileId, operation.operationId);
+    }
+  }
+
+  private async reconcileRemoteOwnership(record: RemoteFileRecord, previousPath?: string): Promise<void> {
+    if (record.deleted) {
+      await this.releasePath(record.path, record.fileId, record.origin.operationId);
+      return;
+    }
+    const destination = await this.readPathOwner(record.path);
+    if (destination.record?.fileId === record.fileId && destination.record.state === "reserved" &&
+        destination.record.operationId === record.origin.operationId) {
+      await this.finalizePath(record.path, record.fileId, record.origin.operationId);
+    }
+    if (previousPath && pathOwnershipKey(previousPath) !== pathOwnershipKey(record.path)) {
+      await this.releasePath(previousPath, record.fileId, record.origin.operationId);
+    }
+  }
+
+  private async resolveOutgoingPath(operation: OutboxOperation, path: string): Promise<string | undefined> {
     const { kv, store, vault, status } = this.options;
-    const colliding = (await kv.list()).map((entry) => ({ ...entry, record: decodeRecord(entry.value) }))
-      .find((entry) => !entry.record.deleted && entry.record.fileId !== operation.fileId &&
-        entry.record.path.toLocaleLowerCase() === path.toLocaleLowerCase());
-    if (!colliding) return path;
+    const ownerEntry = await this.readPathOwner(path);
+    const owner = ownerEntry.record;
+    if (!owner || owner.state === "released" || owner.fileId === operation.fileId) return path;
+    let ownerRecord: RemoteFileRecord | undefined;
+    let ownerRevision = 0;
+    if (owner.state === "owned") {
+      const ownerHead = await kv.get(`f.${owner.fileId}`);
+      if (!ownerHead) {
+        status.lastError = `Path ownership for ${owner.canonicalPath} has no file record; manual recovery is required before reuse.`;
+        status.refresh();
+        throw new Error(status.lastError);
+      }
+      ownerRecord = decodeRecord(ownerHead.value);
+      ownerRevision = ownerHead.revision;
+      if (ownerRecord.deleted || canonicalizeRemotePath(ownerRecord.path) !== owner.canonicalPath) {
+        await this.releasePath(owner.canonicalPath, owner.fileId, operation.operationId);
+        return path;
+      }
+    }
     const copyPath = this.collisionPath(path, operation.fileId);
-    const local = await vault.read(path);
+    const sourcePath = await vault.read(path) ? path : operation.path;
+    const candidate = await vault.read(sourcePath);
+    const local = candidate && sha256Hex(candidate) === operation.localHash ? candidate : undefined;
     if (local && !await vault.read(copyPath)) {
       if (!vault.rename) throw new Error("Vault rename unavailable");
-      this.renameGuards.add(`${path}\0${copyPath}`);
-      await vault.rename(path, copyPath);
+      this.renameGuards.add(`${sourcePath}\0${copyPath}`);
+      await vault.rename(sourcePath, copyPath);
+    } else if (!local) {
+      const localBytes = operation.bytes ?? (operation.content === undefined ? undefined : new TextEncoder().encode(operation.content));
+      if (localBytes) {
+        const existingCopy = await vault.read(copyPath);
+        if (existingCopy && sha256Hex(existingCopy) !== operation.localHash) throw new Error("Conflict copy path occupied");
+        if (!existingCopy) {
+        this.applyGuards.set(copyPath, sha256Hex(localBytes));
+        await vault.write(copyPath, localBytes);
+        }
+      }
     }
     const indexed = await store.getFile(operation.fileId);
-    if (indexed) await store.putFile({ ...indexed, path: copyPath });
-    await store.putConflict({ operationId: `path-${colliding.record.fileId}-${operation.fileId}`,
-      originalFileId: colliding.record.fileId, originalPath: path,
-      copyFileId: operation.fileId, copyPath, remoteRevision: colliding.revision, lifecycle: "unresolved", context: "path-collision",
-      canonicalPath: path, remotePath: colliding.record.path, detectionRemoteHash: colliding.record.contentHash,
-      detectionRemoteDeleted: colliding.record.deleted,
-      detectionLocalHash: local ? sha256Hex(local) : undefined, detectionCopyHash: local ? sha256Hex(local) : undefined,
-      kind: colliding.record.kind, size: colliding.record.size });
-    await store.appendConflictHistory({ operationId: `path-${colliding.record.fileId}-${operation.fileId}`, event: "detected", context: "path-collision", path: copyPath });
+    if (indexed) await store.putFile({ ...indexed, path: copyPath, state: "conflict" });
+    const conflictId = `path-${owner.fileId}-${operation.fileId}`;
+    await store.putConflict({ operationId: conflictId,
+      originalFileId: owner.fileId, originalPath: path,
+      copyFileId: operation.fileId, copyPath, remoteRevision: ownerRevision, lifecycle: "unresolved", context: "path-collision",
+      canonicalPath: path, remotePath: ownerRecord?.path ?? owner.canonicalPath,
+      detectionRemoteHash: ownerRecord?.contentHash, detectionRemoteDeleted: ownerRecord?.deleted ?? false,
+      detectionLocalHash: local ? sha256Hex(local) : operation.localHash,
+      detectionCopyHash: local ? sha256Hex(local) : operation.localHash,
+      kind: ownerRecord?.kind ?? (path.toLowerCase().endsWith(".md") ? "text" : "blob"), size: ownerRecord?.size });
+    await store.appendConflictHistory({ operationId: conflictId, event: "detected", context: "path-collision", path: copyPath });
     status.conflictPaths = (await store.unresolvedConflicts()).map((item) => item.copyPath);
     status.conflicts = status.conflictPaths.length; status.refresh();
-    return copyPath;
+    await store.confirm(operation.operationId);
+    return undefined;
   }
 
   private async isOccupiedByOtherIdentity(fileId: string, path: string, localHash: string | undefined,
     identities: FileIndexEntry[]): Promise<boolean> {
-    const normalized = path.toLocaleLowerCase();
     for (const entry of identities) {
       if (entry.fileId === fileId || entry.deleted) continue;
-      if (entry.path.toLocaleLowerCase() === normalized) return true;
+      if (canonicalizeRemotePath(entry.path) === canonicalizeRemotePath(path)) return true;
       if (!localHash || entry.localHash !== localHash || entry.path === path) continue;
       if (!await this.options.vault.read(entry.path)) return true;
     }
@@ -1052,6 +1224,7 @@ export class MarkdownSyncEngine {
     const { store, vault } = this.options;
     const current = await store.getFile(record.fileId);
     if (current?.remoteRevision !== undefined && current.remoteRevision >= revision) return;
+    await this.reconcileRemoteOwnership(record, current?.path);
     const pending = (await store.pending()).find((item) => item.fileId === record.fileId);
     if (pending) {
       return;
@@ -1115,7 +1288,7 @@ export class MarkdownSyncEngine {
       revision = latest.revision;
     }
     const other = (await store.files()).find((item) => !item.deleted && item.fileId !== record.fileId &&
-      item.path.toLocaleLowerCase() === record.path.toLocaleLowerCase());
+      canonicalizeRemotePath(item.path) === canonicalizeRemotePath(record.path));
     if (!other) return { record, revision };
     const loserId = record.fileId > other.fileId ? record.fileId : other.fileId;
     const copyPath = this.collisionPath(record.path, loserId);
@@ -1134,11 +1307,15 @@ export class MarkdownSyncEngine {
         if (!head) throw new Error("Colliding record unavailable");
         const headRecord = decodeRecord(head.value);
         if (headRecord.path === copyPath) return { record: headRecord, revision: head.revision };
+        const ownershipOperationId = crypto.randomUUID();
         const corrected = { ...headRecord, path: copyPath,
-          origin: { deviceId: this.options.deviceId, operationId: crypto.randomUUID(), clientTime: Date.now() },
+          origin: { deviceId: this.options.deviceId, operationId: ownershipOperationId, clientTime: Date.now() },
           basedOnRevision: head.revision };
         try {
+          await this.reservePath(record.fileId, ownershipOperationId, copyPath);
           const nextRevision = await kv.update!(`f.${record.fileId}`, encodeRecord(corrected), head.revision);
+          await this.finalizePath(copyPath, record.fileId, ownershipOperationId);
+          await this.releasePath(headRecord.path, record.fileId, ownershipOperationId);
           return { record: corrected, revision: nextRevision };
         } catch (error) {
           if ((await kv.get(`f.${record.fileId}`))?.revision === head.revision) throw error;
@@ -1149,10 +1326,15 @@ export class MarkdownSyncEngine {
     if ((await store.pending()).some((item) => item.fileId === other.fileId)) throw new Error("Path collision with pending file");
     const current = await kv.get(`f.${other.fileId}`);
     if (!current) throw new Error("Colliding record unavailable");
-    const corrected = { ...decodeRecord(current.value), path: copyPath,
-      origin: { deviceId: this.options.deviceId, operationId: crypto.randomUUID(), clientTime: Date.now() },
+    const currentRecord = decodeRecord(current.value);
+    const ownershipOperationId = crypto.randomUUID();
+    const corrected = { ...currentRecord, path: copyPath,
+      origin: { deviceId: this.options.deviceId, operationId: ownershipOperationId, clientTime: Date.now() },
       basedOnRevision: current.revision };
+    await this.reservePath(other.fileId, ownershipOperationId, copyPath);
     const nextRevision = await kv.update!(`f.${other.fileId}`, encodeRecord(corrected), current.revision);
+    await this.finalizePath(copyPath, other.fileId, ownershipOperationId);
+    await this.releasePath(currentRecord.path, other.fileId, ownershipOperationId);
     if (await vault.read(other.path)) {
       if (!vault.rename) throw new Error("Vault rename unavailable");
       this.renameGuards.add(`${other.path}\0${copyPath}`);

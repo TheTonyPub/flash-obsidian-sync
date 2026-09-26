@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { encodeRecord, sha256Hex, type RemoteFileRecord } from "../../packages/protocol/src/index.js";
+import { encodePathOwnershipRecord, encodeRecord, pathOwnershipKey, sha256Hex, type RemoteFileRecord } from "../../packages/protocol/src/index.js";
 import { SyncStatus } from "../../packages/plugin/src/connection.js";
 import { LocalStore } from "../../packages/plugin/src/local-store.js";
 import { MarkdownSyncEngine } from "../../packages/plugin/src/markdown-sync.js";
@@ -19,7 +19,12 @@ async function setup(localFiles: Record<string, string>, remoteFiles: RemoteFile
   const kv = new NatsKvDouble();
   const vault = new VaultDouble();
   for (const [path, value] of Object.entries(localFiles)) vault.write(path, bytes(value));
-  for (const value of remoteFiles) kv.create(`f.${value.fileId}`, encodeRecord(value));
+  for (const value of remoteFiles) {
+    kv.create(`f.${value.fileId}`, encodeRecord(value));
+    const canonicalPath = value.path.toLowerCase();
+    kv.create(pathOwnershipKey(value.path), encodePathOwnershipRecord({ schemaVersion: 1, canonicalPath,
+      fileId: value.fileId, operationId: value.origin.operationId, state: "owned" }));
+  }
   const store = await LocalStore.open(`bootstrap-${crypto.randomUUID()}`, indexedDBDouble.indexedDB);
   const status = new SyncStatus();
   const engine = new MarkdownSyncEngine({ deviceId: "local-device", kv, vault, store, status });
@@ -32,9 +37,9 @@ describe("conservative bootstrap", () => {
     await state.engine.start();
     const first = await state.store.getFileByPath("first.md");
     expect(first?.fileId).toBeTruthy();
-    expect(state.kv.list()).toHaveLength(2);
+    expect(state.kv.list().filter(({ key }) => key.startsWith("f."))).toHaveLength(2);
     await state.engine.reconcile();
-    expect(state.kv.list()).toHaveLength(2);
+    expect(state.kv.list().filter(({ key }) => key.startsWith("f."))).toHaveLength(2);
     expect((await state.store.getFileByPath("first.md"))?.fileId).toBe(first?.fileId);
     state.engine.stop(); state.store.close();
   });
@@ -54,7 +59,7 @@ describe("conservative bootstrap", () => {
     ]);
     await state.engine.start();
     expect((await state.store.getFileByPath("same.md"))?.fileId).toBe("remote-a");
-    expect(state.kv.list()).toHaveLength(3);
+    expect(state.kv.list().filter(({ key }) => key.startsWith("f."))).toHaveLength(3);
     expect(text(state.vault, "remote.md")).toBe("remote");
     state.engine.stop(); state.store.close();
   });

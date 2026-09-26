@@ -60,7 +60,7 @@ authorization {
 }
 ```
 
-Use strong unique source passwords, store only their bcrypt hashes in NATS configuration, and provide the source password to the matching vault user through a protected channel. The file-record subject is `$KV.<bucket>.f.<fileId>`; keep the JetStream API and `_INBOX.>` permissions shown above because the KV client needs them for reads, watches, consumer management, and status.
+Use strong unique source passwords, store only their bcrypt hashes in NATS configuration, and provide the source password to the matching vault user through a protected channel. File records use `$KV.<bucket>.f.<fileId>` and path ownership records use `$KV.<bucket>.p.<sha256>`. The bucket-scoped `$KV.OBS_VAULT_A_FILES.>` publish and subscribe permissions shown above include both prefixes. If you narrow these permissions to individual key prefixes, grant read/write access to both `$KV.OBS_VAULT_A_FILES.f.>` and `$KV.OBS_VAULT_A_FILES.p.>`; keep the JetStream API and `_INBOX.>` permissions because the KV client needs them for reads, watches, consumer management, and status.
 
 Terminate TLS at Caddy and proxy only to the private NATS WebSocket listener:
 
@@ -87,5 +87,17 @@ Without this rule, the browser blocks S3 uploads or downloads during the CORS pr
 ## Verification and safe recovery
 
 Test a vault user's `put`, `get`, `watch`, `create`, `update`, and `status` operations only in that vault's bucket. Verify that the same user cannot access another vault's bucket and that invalid credentials are rejected. Check the plugin status after **Connect**; `SYNCED` indicates the initial reconciliation completed.
+
+### Development reset and rebootstrap of a selected vault
+
+Use this data-preserving procedure only for a development vault whose exact Vault ID and bucket you have selected. It clears the selected vault's remote KV contents and its plugin sync indexes so the plugin can rebuild file records (`f.`) and path ownership records (`p.`) together. The reset is unsafe if any device has unsynced changes or unresolved conflicts.
+
+1. Record the exact Vault ID, derived bucket name (`OBS_<VaultID>_FILES`), and every device that syncs this vault. Export or back up the Markdown and attachment files from every device; retain those backups until rebootstrap is verified. Include conflict copies and any divergent local files.
+2. On every device, connect to the selected vault and wait for status `SYNCED` after reconciliation. Verify that the pending outbox count is `0` and the unresolved conflict count is `0` on every device. If any device cannot be checked, is not reconciled, has a pending operation, or has an unresolved conflict, stop; resolve or separately preserve the affected content and repeat these checks before continuing.
+3. Disconnect the plugin on every device so no client can write while the reset is in progress. With the NATS administrator account, clear only the selected bucket's KV data, preserving other vault buckets. Do not remove the NATS store, server, or shared service volumes.
+4. On each device, close Obsidian and clear only that device's IndexedDB database for the selected vault. The database name is `flash-sync-<deviceId>-<VaultID>`; preserve the Markdown files and all other Obsidian/plugin data. Do not clear local sync state until steps 1–3 have passed on every device.
+5. Reopen Obsidian and connect each device to the same Vault ID and NATS bucket. Let reconciliation finish; verify `SYNCED`, zero pending operations, zero unresolved conflicts, and the expected files. Keep the backups until every device passes these checks.
+
+This reset is a development rollout procedure, not routine recovery. For an explicitly disposable test vault, deletion is a separate destructive option: select its exact Vault ID and bucket, then have the NATS administrator delete that entire vault bucket and its vault-specific user/credential. This discards its remote data and does not preserve or rebootstrap files; do not use it for a vault whose contents must be retained. Leave other vault buckets, users, and shared NATS data untouched.
 
 Before adding another device, back up its vault. Review conflict copies instead of deleting them blindly. For recovery, preserve the JetStream store and Caddy certificate data, stop the affected `fos-*` service or Compose project, and inspect `fos status` plus the protected state manifest. Do not remove volumes or the NATS store as part of a retry. Rotate a compromised vault password with the administrator account, import the new handoff on each device, and verify the old credential no longer connects. Revocation removes that vault's retained handoff record after the server change; use rotation with `--keep` when a new recoverable handoff is needed.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeRecord, encodeRecord, sha256Hex } from "../../packages/protocol/src/index.js";
+import { canonicalizeRemotePath, decodeRecord, encodePathOwnershipRecord, encodeRecord, pathOwnershipKey, sha256Hex } from "../../packages/protocol/src/index.js";
 import { MarkdownSyncEngine } from "../../packages/plugin/src/markdown-sync.js";
 import { LocalStore } from "../../packages/plugin/src/local-store.js";
 import { SyncStatus } from "../../packages/plugin/src/connection.js";
@@ -25,6 +25,11 @@ async function replica(deviceId: string, kv: NatsKvDouble) {
   const engine = new MarkdownSyncEngine({ deviceId, vault, store, kv, status, debounceMs: 5 });
   await engine.start();
   return { vault, store, status, engine };
+}
+
+function seedOwner(kv: NatsKvDouble, fileId: string, path: string, operationId = "remote-create"): void {
+  kv.create(pathOwnershipKey(path), encodePathOwnershipRecord({ schemaVersion: 1,
+    canonicalPath: canonicalizeRemotePath(path), fileId, operationId, state: "owned" }));
 }
 
 describe("inline Markdown sync", () => {
@@ -66,6 +71,7 @@ describe("inline Markdown sync", () => {
     kv.create(`f.${remoteId}`, encodeRecord({ schemaVersion: 1, fileId: remoteId, path: "notes/a.md", kind: "text",
       deleted: false, contentHash: sha256Hex(remoteBytes), size: remoteBytes.length, content: "remote",
       origin: { deviceId: "other", operationId: "remote-create", clientTime: 0 } }));
+    seedOwner(kv, remoteId, "notes/a.md");
     let listCalls = 0;
     const list = kv.list.bind(kv);
     kv.list = () => { listCalls++; return list(); };
@@ -73,9 +79,10 @@ describe("inline Markdown sync", () => {
     await a.engine.capture("notes/a.md", "local");
 
     const local = (await a.store.files()).find((entry) => entry.fileId !== remoteId)!;
-    expect(listCalls).toBeGreaterThan(0);
+    expect(listCalls).toBe(0);
     expect(decodeRecord(kv.get(`f.${remoteId}`)!.value).content).toBe("remote");
-    expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value).path).toBe(`notes/a.conflict-${local.fileId}.md`);
+    expect((await a.store.getFile(local.fileId))?.path).toBe(`notes/a.conflict-${local.fileId}.md`);
+    expect(text(a.vault, `notes/a.conflict-${local.fileId}.md`)).toBe("local");
     a.engine.stop(); a.store.close();
   });
 
@@ -89,6 +96,7 @@ describe("inline Markdown sync", () => {
     kv.create(`f.${remoteId}`, encodeRecord({ schemaVersion: 1, fileId: remoteId, path: "notes/dest.md", kind: "text",
       deleted: false, contentHash: sha256Hex(remoteBytes), size: remoteBytes.length, content: "remote",
       origin: { deviceId: "other", operationId: "remote-create", clientTime: 0 } }));
+    seedOwner(kv, remoteId, "notes/dest.md");
     let listCalls = 0;
     const list = kv.list.bind(kv);
     kv.list = () => { listCalls++; return list(); };
@@ -96,9 +104,10 @@ describe("inline Markdown sync", () => {
     a.vault.rename("notes/source.md", "notes/dest.md");
     await a.engine.rename("notes/source.md", "notes/dest.md");
 
-    expect(listCalls).toBeGreaterThan(0);
+    expect(listCalls).toBe(0);
     expect(decodeRecord(kv.get(`f.${remoteId}`)!.value).content).toBe("remote");
-    expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value).path).toBe(`notes/dest.conflict-${local.fileId}.md`);
+    expect((await a.store.getFile(local.fileId))?.path).toBe(`notes/dest.conflict-${local.fileId}.md`);
+    expect(text(a.vault, `notes/dest.conflict-${local.fileId}.md`)).toBe("local");
     a.engine.stop(); a.store.close();
   });
 
@@ -115,15 +124,17 @@ describe("inline Markdown sync", () => {
     kv.create(`f.${remoteId}`, encodeRecord({ schemaVersion: 1, fileId: remoteId, path: "notes/moved.md", kind: "text",
       deleted: false, contentHash: sha256Hex(remoteBytes), size: remoteBytes.length, content: "remote",
       origin: { deviceId: "other", operationId: "remote-create", clientTime: 0 } }));
+    seedOwner(kv, remoteId, "notes/moved.md");
     let listCalls = 0;
     const list = kv.list.bind(kv);
     kv.list = () => { listCalls++; return list(); };
 
     await a.engine.capture("notes/a.md", "edited");
 
-    expect(listCalls).toBeGreaterThan(0);
+    expect(listCalls).toBe(0);
     expect(decodeRecord(kv.get(`f.${remoteId}`)!.value).content).toBe("remote");
-    expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value).path).toBe(`notes/moved.conflict-${local.fileId}.md`);
+    expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value).path).toBe("notes/moved.md");
+    expect(text(a.vault, `notes/moved.conflict-${local.fileId}.md`)).toBe("edited");
     a.engine.stop(); a.store.close();
   });
 
@@ -141,7 +152,7 @@ describe("inline Markdown sync", () => {
 
     await a.engine.capture("notes/moved.md", "edited");
 
-    expect(listCalls).toBeGreaterThan(0);
+    expect(listCalls).toBe(0);
     expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value)).toMatchObject({ path: "notes/a.md", content: "edited" });
     expect(text(a.vault, "notes/a.md")).toBe("edited");
     expect(await a.store.pending()).toEqual([]);
@@ -159,6 +170,10 @@ describe("inline Markdown sync", () => {
     kv.create(`f.${remoteId}`, encodeRecord({ schemaVersion: 1, fileId: remoteId, path: "notes/a.md", kind: "text",
       deleted: false, contentHash: sha256Hex(remoteBytes), size: remoteBytes.length, content: "remote",
       origin: { deviceId: "other", operationId: "remote-create", clientTime: 0 } }));
+    const pathKey = pathOwnershipKey("notes/a.md");
+    const localOwner = kv.get(pathKey)!;
+    kv.update(pathKey, encodePathOwnershipRecord({ schemaVersion: 1, canonicalPath: canonicalizeRemotePath("notes/a.md"),
+      fileId: remoteId, operationId: "remote-create", state: "owned" }), localOwner.revision);
     const get = kv.get.bind(kv);
     kv.get = (key) => key === `f.${local.fileId}` ? null : get(key);
     let listCalls = 0;
@@ -168,10 +183,10 @@ describe("inline Markdown sync", () => {
     a.vault.files.set("notes/a.md", new TextEncoder().encode("edited"));
     await a.engine.capture("notes/a.md", "edited");
 
-    expect(listCalls).toBeGreaterThan(0);
+    expect(listCalls).toBe(0);
     expect(decodeRecord(kv.get(`f.${remoteId}`)!.value).content).toBe("remote");
     expect(text(a.vault, `notes/a.conflict-${local.fileId}.md`)).toBe("edited");
-    expect(await a.store.pending()).toHaveLength(1);
+    expect(await a.store.pending()).toEqual([]);
     a.engine.stop(); a.store.close();
   });
 
@@ -191,7 +206,7 @@ describe("inline Markdown sync", () => {
 
     await a.engine.capture("notes/a.md", "edited");
 
-    expect(listCalls).toBeGreaterThan(0);
+    expect(listCalls).toBe(0);
     expect(decodeRecord(kv.get(`f.${local.fileId}`)!.value).deleted).toBe(true);
     const conflict = (await a.store.conflicts()).find((entry) => entry.originalFileId === local.fileId);
     expect(conflict).toBeDefined();
@@ -252,7 +267,7 @@ describe("inline Markdown sync", () => {
     const kv = new NatsKvDouble();
     const a = await replica("device-a", kv);
     a.vault.write("notes/a.md", new TextEncoder().encode("base"));
-    await eventually(() => kv.list().length === 1);
+    await eventually(() => kv.list().filter((entry) => entry.key.startsWith("f.")).length === 1);
     const file = await a.store.getFileByPath("notes/a.md");
     expect(file).toBeDefined();
 
@@ -303,7 +318,7 @@ describe("inline Markdown sync", () => {
     a.vault.rename("notes/todo_diff.md", "notes/todo.md");
     await a.engine.rename("notes/todo_diff.md", "notes/todo.md");
 
-    expect(writes.slice(-2)).toEqual([`f.${fileA!.fileId}`, `f.${fileB!.fileId}`]);
+    expect(writes.filter((key) => key.startsWith("f.")).slice(-2)).toEqual([`f.${fileA!.fileId}`, `f.${fileB!.fileId}`]);
     expect(decodeRecord(kv.get(`f.${fileA!.fileId}`)!.value).deleted).toBe(true);
     expect(decodeRecord(kv.get(`f.${fileB!.fileId}`)!.value)).toMatchObject({ path: "notes/todo.md", deleted: false });
     a.engine.stop(); a.store.close();

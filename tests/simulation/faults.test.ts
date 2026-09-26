@@ -76,9 +76,10 @@ describe("multi-replica fault simulations", () => {
       await a.engine.capture("note.md", "first");
       a.vault.write("note.md", bytes("second"));
       await a.engine.capture("note.md", "second");
-      expect(delayed.events).toHaveLength(2);
-      const latest = backend.list()[0]!;
-      delayed.deliver(...order);
+      const fileEvents = delayed.events.map((event, index) => event.key.startsWith("f.") ? index : -1).filter((index) => index >= 0);
+      expect(fileEvents).toHaveLength(2);
+      const latest = backend.list().find((entry) => entry.key.startsWith("f."))!;
+      delayed.deliver(...order.map((index) => fileEvents[index]!));
       await b.engine.settle();
       expect(text(b.vault, "note.md")).toBe("second");
       expect((await b.store.getFileByPath("note.md"))?.remoteRevision).toBe(latest.revision);
@@ -101,7 +102,7 @@ describe("multi-replica fault simulations", () => {
     vault.files.set("note.md", bytes("durable draft"));
     await a.engine.capture("note.md", "durable draft");
     expect(await store.pending()).toHaveLength(1);
-    const committed = backend.list()[0]!;
+    const committed = backend.list().find((entry) => entry.key.startsWith("f."))!;
     a.engine.stop(); await a.engine.settle(); store.close();
 
     const reopened = await LocalStore.open(name, indexedDBDouble.indexedDB);
@@ -132,8 +133,9 @@ describe("multi-replica fault simulations", () => {
     const resumedB = await replica("b", transport, b.vault, b.store);
     await eventually(() => text(b.vault, "note.md") === "after outage");
     expect(await a.store.pending()).toEqual([]);
-    expect(decodeRecord(backend.list()[0]!.value).content).toBe("after outage");
-    expect(decodeRecord(backend.list()[0]!.value).contentHash).toBe(sha256Hex(b.vault.read("note.md")!));
+    const committed = backend.list().find((entry) => entry.key.startsWith("f."))!;
+    expect(decodeRecord(committed.value).content).toBe("after outage");
+    expect(decodeRecord(committed.value).contentHash).toBe(sha256Hex(b.vault.read("note.md")!));
     resumedA.engine.stop(); resumedB.engine.stop();
     await resumedA.engine.settle(); await resumedB.engine.settle();
     a.store.close(); b.store.close();
@@ -148,7 +150,7 @@ describe("multi-replica fault simulations", () => {
       const a = await replica("a", backend);
       const b = await replica("b", backend);
       await a.engine.reconcile(); await b.engine.reconcile();
-      const remote = backend.list().map((entry) => decodeRecord(entry.value));
+      const remote = backend.list().filter((entry) => entry.key.startsWith("f.")).map((entry) => decodeRecord(entry.value));
       expect(new Set(remote.map((entry) => entry.path)).size).toBe(2);
       expect(remote.find((entry) => entry.fileId === "file-a")?.path).toBe("same.md");
       expect(remote.find((entry) => entry.fileId === "file-z")?.path).toBe("same.conflict-file-z.md");

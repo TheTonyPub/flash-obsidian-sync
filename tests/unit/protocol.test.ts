@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   createFileId,
+  canonicalizeRemotePath,
+  decodePathOwnershipRecord,
   decodeRecord,
+  encodePathOwnershipRecord,
   encodeRecord,
   normalizePath,
+  pathOwnershipKey,
   recordKey,
   sha256Hex,
   type RemoteFileRecord,
@@ -73,5 +77,29 @@ describe("identity, paths, hashing", () => {
     expect(await sha256Hex(new TextEncoder().encode("a\r\n"))).not.toBe(
       await sha256Hex(new TextEncoder().encode("a\n")),
     );
+  });
+
+  it.each([
+    ["notes/cafe\u0301.md", "notes/café.md"],
+    ["Notes\\Straße.MD", "notes/strasse.md"],
+    ["Σ/ς/σ.md", "σ/σ/σ.md"],
+  ])("canonicalizes remote path %s identically on every client", (input, expected) => {
+    expect(canonicalizeRemotePath(input)).toBe(expected);
+  });
+
+  it("maps Desktop and Mobile spellings to one ownership identity", () => {
+    const desktop = canonicalizeRemotePath("Journal\\Café\\Straße.md");
+    const mobile = canonicalizeRemotePath("journal/cafe\u0301/STRASSE.MD");
+    expect(desktop).toBe("journal/café/strasse.md");
+    expect(mobile).toBe(desktop);
+  });
+
+  it("validates path ownership records against their canonical key", () => {
+    const owner = { schemaVersion: 1 as const, canonicalPath: "notes/strasse.md", fileId: "file-1", operationId: "op-1", state: "reserved" as const };
+    const key = pathOwnershipKey("Notes/Straße.md");
+    expect(key).toMatch(/^p\.[0-9a-f]{64}$/);
+    expect(decodePathOwnershipRecord(encodePathOwnershipRecord(owner), key)).toEqual(owner);
+    expect(() => decodePathOwnershipRecord(encodePathOwnershipRecord(owner), `p.${"0".repeat(64)}`)).toThrow(/key mismatch/);
+    expect(() => encodePathOwnershipRecord({ ...owner, state: "invalid" } as never)).toThrow(/state/);
   });
 });
