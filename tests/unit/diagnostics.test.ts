@@ -53,7 +53,7 @@ describe("plugin diagnostics", () => {
     expect(status.lastError).toContain("Permission Violation on $JS.API.CONSUMER.CREATE");
     expect(sink.error).toHaveBeenCalledWith(
       expect.stringContaining("Permission Violation on $JS.API.CONSUMER.CREATE"),
-      expect.objectContaining({ stage: "watch" }),
+      expect.objectContaining({ stage: "snapshot", discoveryMode: "legacy-list", snapshotComplete: false }),
     );
     engine.stop();
     store.close();

@@ -1,4 +1,5 @@
 import { Kvm, type KV } from "@nats-io/kv";
+import { AckPolicy, DeliverPolicy, jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { wsconnect, type NatsConnection } from "@nats-io/nats-core";
 import { errorSummary, type PluginLogger } from "./diagnostics.js";
 
@@ -19,6 +20,25 @@ export interface RemoteEntry {
   revision: number;
 }
 
+/** One versioned file record delivered by a discovery session. */
+export interface KvFileEntry extends RemoteEntry {
+  key: string;
+}
+
+/** A single discovery session that emits the initial current state and then live updates. */
+export interface KvSnapshotSession {
+  /** Number of entries belonging to the initial snapshot, captured when the session opens. */
+  readonly initialCount: number;
+  /** Resolves when every entry in the session's initial snapshot has been emitted. */
+  readonly snapshotComplete: Promise<void>;
+  /** Initial current-state entries, including tombstones. */
+  readonly snapshot: AsyncIterable<KvFileEntry>;
+  /** All entries from this session, including the snapshot and subsequent updates. */
+  readonly entries: AsyncIterable<KvFileEntry>;
+  /** Stop delivery and release the underlying ephemeral subscription. */
+  stop(): void | Promise<void>;
+}
+
 export interface KvPort {
   readonly maxValueBytes?: number;
   get(key: string): RemoteEntry | null | undefined | Promise<RemoteEntry | null | undefined>;
@@ -26,6 +46,8 @@ export interface KvPort {
   put(key: string, value: Uint8Array): number | Promise<number>;
   watch(listener: (entry: { key: string; value: Uint8Array; revision: number }) => void):
     (() => void) | Promise<() => void>;
+  /** Optional until adapters implement the primary snapshot discovery path. */
+  openSnapshotSession?(): KvSnapshotSession | Promise<KvSnapshotSession>;
   create?(key: string, value: Uint8Array): number | Promise<number>;
   update?(key: string, value: Uint8Array, revision: number): number | Promise<number>;
   close?(): Promise<void>;
@@ -119,6 +141,8 @@ export async function connectVault(
 }
 
 export class NatsKvAdapter implements KvPort {
+  private readonly snapshotSessionStops = new Set<() => Promise<void>>();
+
   constructor(private readonly kv: KV, private readonly connection: NatsConnection,
     private readonly bucketMaxValueSize = 0, private readonly logger?: PluginLogger,
     private readonly bucketName?: string) {}
@@ -128,8 +152,12 @@ export class NatsKvAdapter implements KvPort {
     return limits.length ? Math.min(...limits) : 512 * 1024;
   }
 
-  close(): Promise<void> {
-    return this.connection.close();
+  async close(): Promise<void> {
+    try {
+      await Promise.all([...this.snapshotSessionStops].map((stop) => stop()));
+    } finally {
+      await this.connection.close();
+    }
   }
 
   async get(key: string): Promise<RemoteEntry | null> {
@@ -177,6 +205,112 @@ export class NatsKvAdapter implements KvPort {
     return this.kv.update(key, value, revision);
   }
 
+  async openSnapshotSession(): Promise<KvSnapshotSession> {
+    if (!this.bucketName) throw new Error("KV bucket name required for snapshot discovery");
+
+    const stream = `KV_${this.bucketName}`;
+    const manager = await jetstreamManager(this.connection, { checkAPI: false });
+    let created = false;
+    let consumerName: string | undefined;
+    try {
+      const consumerInfo = await manager.consumers.add(stream, {
+        name: `flash-sync-snapshot-${crypto.randomUUID()}`,
+        ack_policy: AckPolicy.None,
+        deliver_policy: DeliverPolicy.LastPerSubject,
+        filter_subject: `$KV.${this.bucketName}.f.>`,
+      });
+      created = true;
+      const consumerId = consumerInfo.name;
+      if (!consumerId) throw new Error("JetStream did not return the ephemeral consumer name");
+      consumerName = consumerId;
+
+      const initialCount = consumerInfo.num_pending;
+      // Pull delivery retains pending messages until consume requests them, avoiding a push-subscription setup gap.
+      const consumer = await jetstream(this.connection).consumers.get(stream, consumerId);
+      const messages = await consumer.consume();
+      const snapshotQueue = new AsyncEntryQueue<KvFileEntry>();
+      const entriesQueue = new AsyncEntryQueue<KvFileEntry>();
+      let snapshotSeen = 0;
+      let snapshotResolved = false;
+      let resolveSnapshot!: () => void;
+      let rejectSnapshot!: (error: unknown) => void;
+      const snapshotComplete = new Promise<void>((resolve, reject) => {
+        resolveSnapshot = resolve;
+        rejectSnapshot = reject;
+      });
+      void snapshotComplete.catch(() => {});
+      if (initialCount === 0) {
+        snapshotResolved = true;
+        resolveSnapshot();
+      }
+
+      let stopped = false;
+      const stop = async (): Promise<void> => {
+        if (stopped) return;
+        stopped = true;
+        this.snapshotSessionStops.delete(stop);
+        messages.stop();
+        snapshotQueue.close();
+        entriesQueue.close();
+        if (!snapshotResolved) rejectSnapshot(new Error("Snapshot session stopped before completion"));
+        await manager.consumers.delete(stream, consumerId);
+      };
+      this.snapshotSessionStops.add(stop);
+
+      void (async () => {
+        try {
+          for await (const message of messages) {
+            const subjectPrefix = `$KV.${this.bucketName}.`;
+            if (!message.subject.startsWith(subjectPrefix)) continue;
+            const key = message.subject.slice(subjectPrefix.length);
+            if (!key.startsWith("f.")) continue;
+            const entry = { key, value: message.data, revision: message.info.streamSequence };
+            entriesQueue.push(entry);
+            if (snapshotSeen < initialCount) {
+              snapshotSeen += 1;
+              snapshotQueue.push(entry);
+              if (snapshotSeen === initialCount) {
+                snapshotResolved = true;
+                resolveSnapshot();
+              }
+            }
+          }
+          if (stopped) {
+            snapshotQueue.close();
+            entriesQueue.close();
+          } else {
+            const error = new Error("Snapshot session delivery ended");
+            if (!snapshotResolved) rejectSnapshot(error);
+            snapshotQueue.close(error);
+            entriesQueue.close(error);
+            await stop().catch((cleanupError: unknown) => {
+              this.logger?.error("nats.snapshot_session_cleanup_failed", cleanupError, { bucket: this.bucketName });
+            });
+          }
+        } catch (error) {
+          this.logger?.error("nats.snapshot_session_failed", error, { bucket: this.bucketName });
+          if (!snapshotResolved) rejectSnapshot(error);
+          snapshotQueue.close(error);
+          entriesQueue.close(error);
+          await stop().catch((cleanupError: unknown) => {
+            this.logger?.error("nats.snapshot_session_cleanup_failed", cleanupError, { bucket: this.bucketName });
+          });
+        }
+      })();
+
+      return {
+        initialCount,
+        snapshotComplete,
+        snapshot: { [Symbol.asyncIterator]: () => snapshotQueue.take(initialCount) },
+        entries: { [Symbol.asyncIterator]: () => entriesQueue.take() },
+        stop,
+      };
+    } catch (error) {
+      if (created && consumerName) await manager.consumers.delete(stream, consumerName).catch(() => false);
+      throw error;
+    }
+  }
+
   async watch(listener: (entry: { key: string; value: Uint8Array; revision: number }) => void): Promise<() => void> {
     const iterator = await this.kv.watch();
     void (async () => {
@@ -188,6 +322,49 @@ export class NatsKvAdapter implements KvPort {
       /* Reconciliation reopens the watch after reconnect. */
     });
     return () => iterator.stop();
+  }
+}
+
+class AsyncEntryQueue<T> {
+  private readonly values: T[] = [];
+  private readonly waiters: Array<{ resolve: (value: IteratorResult<T>) => void; reject: (error: unknown) => void }> = [];
+  private ended = false;
+  private failure?: unknown;
+
+  push(value: T): void {
+    const waiter = this.waiters.shift();
+    if (waiter) waiter.resolve({ value, done: false });
+    else this.values.push(value);
+  }
+
+  close(error?: unknown): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.failure = error;
+    for (const waiter of this.waiters.splice(0)) {
+      if (error) waiter.reject(error);
+      else waiter.resolve({ value: undefined, done: true });
+    }
+  }
+
+  take(limit = Number.POSITIVE_INFINITY): AsyncIterator<T> {
+    let taken = 0;
+    return {
+      next: async (): Promise<IteratorResult<T>> => {
+        if (taken >= limit) return { value: undefined, done: true };
+        if (this.values.length > 0) {
+          taken += 1;
+          return { value: this.values.shift()!, done: false };
+        }
+        if (this.ended) {
+          if (this.failure) throw this.failure;
+          return { value: undefined, done: true };
+        }
+        const value = await new Promise<IteratorResult<T>>((resolve, reject) => this.waiters.push({ resolve, reject }));
+        if (!value.done) taken += 1;
+        return value;
+      },
+    };
   }
 }
 

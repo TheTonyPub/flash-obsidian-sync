@@ -2,7 +2,7 @@
 
 See [proposal.md](proposal.md) for the measured motivation. `MarkdownSync.reconcileOnce` currently starts a buffered live watch, scans local files, calls `KvPort.list()`, applies the resulting records, drains the buffered watch, then replays the durable outbox. `NatsKvAdapter.list()` obtains names through `kv.keys()` and performs one `get()` per name with up to eight workers.
 
-`@nats-io/kv` 3.4 creates an ephemeral `LastValue` watch consumer and internally derives `isUpdate` from `ConsumerInfo.num_pending`, but its public `watch()` iterator has no completion signal when the snapshot has zero values. The installed public JetStream API exposes ephemeral push consumers and `ConsumerInfo.num_pending`; those APIs provide the required empty-bucket barrier without reading the KV library's private iterator fields.
+`@nats-io/kv` 3.4 creates an ephemeral `LastValue` watch consumer and internally derives `isUpdate` from `ConsumerInfo.num_pending`, but its public `watch()` iterator has no completion signal when the snapshot has zero values. The installed public JetStream API exposes ephemeral pull consumers and `ConsumerInfo.num_pending`; those APIs provide the required empty-bucket barrier without reading the KV library's private iterator fields.
 
 ## Goals / Non-Goals
 
@@ -23,9 +23,9 @@ See [proposal.md](proposal.md) for the measured motivation. `MarkdownSync.reconc
 
 Extend the plugin's remote port with a session abstraction that exposes current entries, subsequent entries, a snapshot-complete barrier, and a stop operation. The reconciliation layer consumes that session rather than separately starting a generic watch and calling `list()`.
 
-The NATS adapter will create one uniquely named ephemeral push consumer using public JetStream APIs, scoped to the current vault bucket's `f.>` subjects with `LastPerSubject` delivery. It will read `ConsumerInfo.num_pending` immediately after consumer creation. That count defines the snapshot boundary: zero completes immediately; otherwise the session marks the boundary immediately after it has delivered that many initial values. Entries after the boundary are live values from the same consumer.
+The NATS adapter will create one uniquely named ephemeral pull consumer using public JetStream APIs, scoped to the current vault bucket's `f.>` subjects with `LastPerSubject` delivery. It will read `ConsumerInfo.num_pending` immediately after consumer creation. That count defines the snapshot boundary: zero completes immediately; otherwise the session marks the boundary immediately after it has delivered that many initial values. The same consumer's continuous `consume()` flow supplies later live values.
 
-This avoids private `QueuedIterator` internals and preserves the existing no-gap property. A generic KV `watch()` alone was rejected because an empty bucket produces no entry from which its public API can signal that initial state is complete. A durable consumer/cursor or a second catch-up consumer was rejected because the user selected an ephemeral one-consumer startup path and does not require retained history.
+This avoids private `QueuedIterator` internals and preserves the existing no-gap property. A generic KV `watch()` alone was rejected because an empty bucket produces no entry from which its public API can signal that initial state is complete. Push delivery was rejected because creating the consumer before attaching the SDK subscription leaves a delivery-timing question that the pull consumer avoids: pending messages remain on the consumer until requested. A durable consumer/cursor or a second catch-up consumer was rejected because the user selected an ephemeral one-consumer startup path and does not require retained history.
 
 ### Buffer the session until reconciliation can apply it
 
@@ -45,7 +45,7 @@ The consumer remains limited to the configured vault bucket and `f.>` file recor
 
 ### Measure paths without logging content
 
-Add structured local diagnostics for discovery mode (`snapshot-watch` or `legacy-list`), initial-entry count, snapshot completion, fallback reason/class, and phase/total durations. A benchmark fixture will seed the same representative vault for both modes and report count and timings. It must not include note contents, credentials, or a hard performance assertion.
+Add structured local diagnostics for discovery mode (`snapshot-pull` or `legacy-list`), initial-entry count, snapshot completion, fallback reason/class, and phase/total durations. A benchmark fixture will seed the same representative vault for both modes and report count and timings. It must not include note contents, credentials, or a hard performance assertion.
 
 ## Risks / Trade-offs
 
@@ -61,6 +61,8 @@ Add structured local diagnostics for discovery mode (`snapshot-watch` or `legacy
 2. Run targeted unit, integration, and fault/reconnect simulations, then the repeatable benchmark against the same seeded vault.
 3. If a regression is found, restore the legacy buffered-watch-plus-list discovery path in a patch release; existing KV records, IndexedDB data, and permissions remain compatible.
 
-## Open Questions
+## Verification Results
 
-- Confirm the lowest supported NATS server version accepts the ephemeral public JetStream consumer configuration used by the adapter; this affects compatibility testing and fallback coverage, not the selected algorithm.
+- The repository's lowest supported upstream NATS version is 2.10.7 (Ubuntu 24.04 package lock `2.10.7-1ubuntu0.3`). The adapter integration passed 2/2 tests against an isolated NATS 2.10.7 server, covering nonempty snapshot values and tombstones, post-snapshot live delivery, empty-snapshot completion, and ephemeral consumer cleanup. A consumer-setup or snapshot failure still selects the existing buffered-watch-plus-list fallback; fallback failure leaves reconciliation incomplete and preserves the outbox.
+- The benchmark used one temporary bucket with 144 synthetic 1 KiB values over three alternating rounds on that NATS 2.10.7 instance. Primary snapshot samples were 714.09, 579.55, and 677.20 ms (median 677.20 ms); legacy list samples were 2538.36, 1766.87, and 1697.40 ms (median 1766.87 ms). These are observed timings, not a performance guarantee.
+- Compatibility was exercised with the test administrator connection. The exact scoped-user permission integration was not repeated on NATS 2.10.7; no server permissions or production configuration were changed.

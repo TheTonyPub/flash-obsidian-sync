@@ -46,12 +46,19 @@ export function retryDelay(failures: number): number {
 
 type Watched = { key: string; value: Uint8Array; revision: number };
 
+function errorClass(error: unknown): string {
+  if (error instanceof TypeError) return "TypeError";
+  if (error instanceof RangeError) return "RangeError";
+  return error instanceof Error ? "Error" : "Unknown";
+}
+
 class BlobStorageUnavailableError extends Error {
   constructor() { super("S3 storage is not configured; large files remain local and pending"); }
 }
 
 export class MarkdownSyncEngine {
   private stopWatch?: () => void;
+  private stopSnapshotSession?: () => void | Promise<void>;
   private stopVault?: () => void;
   private stopRename?: () => void;
   private stopDelete?: () => void;
@@ -66,6 +73,8 @@ export class MarkdownSyncEngine {
   private retryTimer?: ReturnType<typeof setTimeout>;
   private buffering = true;
   private readonly buffered: Watched[] = [];
+  private readonly remoteRevisionBoundary = new Map<string, number>();
+  private discoveryHealthy = false;
   private stopped = false;
 
   constructor(private readonly options: MarkdownSyncOptions) {}
@@ -109,7 +118,13 @@ export class MarkdownSyncEngine {
 
   stop(): void {
     this.stopped = true;
+    this.discoveryHealthy = false;
     this.stopWatch?.();
+    const stopSession = this.stopSnapshotSession;
+    this.stopSnapshotSession = undefined;
+    void Promise.resolve().then(() => stopSession?.()).catch((error: unknown) => {
+      this.options.logger?.error("reconcile.snapshot_cleanup_failed", error);
+    });
     this.stopVault?.();
     this.stopRename?.();
     this.stopDelete?.();
@@ -388,6 +403,16 @@ export class MarkdownSyncEngine {
     return work;
   }
 
+  private scheduleReconcileAfterSnapshotFailure(): void {
+    if (this.stopped) return;
+    const current = this.reconcilePromise;
+    void Promise.resolve(current).catch(() => {}).then(() => {
+      if (!this.stopped && !this.reconcilePromise) return this.reconcile();
+    }).catch((error: unknown) => {
+      this.options.logger?.error("reconcile.snapshot_retry_failed", error);
+    });
+  }
+
   private async reconcileOnce(): Promise<void> {
     const { status, store, kv, vault } = this.options;
     const startedAt = performance.now();
@@ -399,7 +424,23 @@ export class MarkdownSyncEngine {
     let outboxReplayMs = 0;
     let remoteApplied = 0;
     let localApplied = 0;
-    let stage = "watch";
+    let stage = "snapshot";
+    let remote: Watched[] = [];
+    let sourceFailure: unknown;
+    let snapshotUsed = false;
+    let discoveryMode: "snapshot-pull" | "legacy-list" = "snapshot-pull";
+    let initialEntryCount = 0;
+    let snapshotComplete = false;
+    let fallbackReasonClass: string | undefined;
+    let discoveryMs = 0;
+    let primaryPhase = "consumer_creation";
+    this.discoveryHealthy = false;
+    const applyRevision = async (entry: Watched): Promise<boolean> => {
+      if ((this.remoteRevisionBoundary.get(entry.key) ?? -1) >= entry.revision) return false;
+      await this.applyRemote(entry.value, entry.revision);
+      this.remoteRevisionBoundary.set(entry.key, entry.revision);
+      return true;
+    };
     status.reconciled = false;
     status.pending = (await store.pending()).length;
     status.conflictPaths = (await store.unresolvedConflicts()).map((item) => item.copyPath);
@@ -409,11 +450,88 @@ export class MarkdownSyncEngine {
     try {
       const watchSetupStartedAt = performance.now();
       this.stopWatch?.();
-      this.stopWatch = await kv.watch((entry) => {
-        if (!entry.key.startsWith("f.")) return;
-        if (this.buffering) this.buffered.push(entry);
-        else this.queueLive(entry);
-      });
+      try { await this.stopSnapshotSession?.(); }
+      catch (cleanupError) { this.options.logger?.error("reconcile.snapshot_cleanup_failed", cleanupError); }
+      this.stopWatch = undefined;
+      this.stopSnapshotSession = undefined;
+      this.buffered.splice(0);
+      try {
+        if (!kv.openSnapshotSession) throw new Error("Snapshot discovery is not supported by this adapter");
+        const discoveryStartedAt = performance.now();
+        const session = await kv.openSnapshotSession();
+        snapshotUsed = true;
+        initialEntryCount = session.initialCount;
+        primaryPhase = "snapshot_consumption";
+        let sessionStopped = false;
+        this.stopSnapshotSession = async () => {
+          sessionStopped = true;
+          await session.stop();
+        };
+        const initialEntries = new Promise<void>((resolve, reject) => {
+          let received = 0;
+          if (session.initialCount === 0) resolve();
+          const iterator = session.entries[Symbol.asyncIterator]();
+          void (async () => {
+            try {
+              while (true) {
+                const next = await iterator.next();
+                if (next.done) throw new Error("Snapshot delivery ended before the session was stopped");
+                const entry = next.value;
+                if (entry.key.startsWith("f.")) {
+                  if (this.buffering) this.buffered.push(entry);
+                  else this.queueLive(entry);
+                }
+                if (received < session.initialCount && ++received === session.initialCount) resolve();
+              }
+            } catch (error) {
+              if (sessionStopped) return;
+              sourceFailure = error;
+              this.discoveryHealthy = false;
+              status.reconciled = false;
+              status.refresh();
+              reject(error);
+              this.scheduleReconcileAfterSnapshotFailure();
+            }
+          })();
+        });
+        void initialEntries.catch(() => {});
+        const snapshot: Watched[] = [];
+        for await (const entry of session.snapshot) snapshot.push(entry);
+        if (snapshot.length !== session.initialCount) throw new Error("Snapshot delivery was incomplete");
+        primaryPhase = "snapshot_completion";
+        await session.snapshotComplete;
+        await initialEntries;
+        if (sourceFailure) throw sourceFailure;
+        this.discoveryHealthy = true;
+        remote = snapshot.filter((entry) => entry.key.startsWith("f."));
+        snapshotComplete = true;
+        discoveryMs = Math.round(performance.now() - discoveryStartedAt);
+      } catch (error) {
+        if (this.stopSnapshotSession) {
+          try { await this.stopSnapshotSession(); }
+          catch (cleanupError) { this.options.logger?.error("reconcile.snapshot_cleanup_failed", cleanupError); }
+        }
+        this.stopSnapshotSession = undefined;
+        snapshotUsed = false;
+        discoveryMode = "legacy-list";
+        fallbackReasonClass = `${sourceFailure ? "live_delivery" : primaryPhase}:${errorClass(sourceFailure ?? error)}`;
+        this.buffered.splice(0);
+        sourceFailure = undefined;
+        this.options.logger?.debug("reconcile.snapshot_fallback", {
+          discoveryMode, fallbackReasonClass, initialEntryCount, snapshotComplete,
+        });
+        this.stopWatch = await kv.watch((entry) => {
+          if (!entry.key.startsWith("f.")) return;
+          if (this.buffering) this.buffered.push(entry);
+          else this.queueLive(entry);
+        });
+        const remoteListStartedAt = performance.now();
+        remote = (await kv.list()).filter((entry) => entry.key.startsWith("f."));
+        initialEntryCount = remote.length;
+        this.discoveryHealthy = true;
+        remoteListMs = Math.round(performance.now() - remoteListStartedAt);
+        discoveryMs = remoteListMs;
+      }
       watchSetupMs = Math.round(performance.now() - watchSetupStartedAt);
       stage = "local_scan";
       const localScanStartedAt = performance.now();
@@ -426,14 +544,13 @@ export class MarkdownSyncEngine {
       const localByPath = new Map(local.map((file) => [file.path, file]));
       localScanMs = Math.round(performance.now() - localScanStartedAt);
       stage = "remote_list";
-      const remoteListStartedAt = performance.now();
-      const remote = (await kv.list()).filter((entry) => entry.key.startsWith("f.")).sort((left, right) => {
+      remote = remote.sort((left, right) => {
         try {
           return Number(decodeRecord(right.value).deleted) - Number(decodeRecord(left.value).deleted);
         } catch { return 0; }
       });
       await this.recoverPathReuse(local, remote);
-      remoteListMs = Math.round(performance.now() - remoteListStartedAt);
+      if (snapshotUsed) remoteListMs = discoveryMs;
       this.options.logger?.debug("reconcile.snapshot", { localFiles: local.length, remoteFiles: remote.length });
       stage = "remote_apply";
       const remoteApplyStartedAt = performance.now();
@@ -444,7 +561,7 @@ export class MarkdownSyncEngine {
         catch { this.reportRecoverableIssue("A remote file record could not be decoded during reconciliation."); continue; }
         if (isConflictReviewPath(record.path)) continue;
         if (!record.deleted) remotePaths.add(record.path);
-        if (record.deleted) { await this.applyRemote(entry.value, entry.revision); remoteApplied++; continue; }
+        if (record.deleted) { if (await applyRevision(entry)) remoteApplied++; continue; }
         const indexed = await store.getFile(record.fileId);
         const existing = localByPath.get(record.path);
         if (!indexed && existing && !await store.getFileByPath(record.path)) {
@@ -460,15 +577,59 @@ export class MarkdownSyncEngine {
           !(await store.pending()).some((item) => item.fileId === indexed.fileId)) {
           await this.captureBytes(record.path, existing.bytes);
         }
-        await this.applyRemote(entry.value, entry.revision);
-        remoteApplied++;
+        if (await applyRevision(entry)) remoteApplied++;
       }
       while (this.buffered.length) {
         const batch = this.buffered.splice(0).sort((a, b) => a.revision - b.revision);
-        for (const entry of batch) await this.applyRemote(entry.value, entry.revision);
-        remoteApplied += batch.length;
+        for (const entry of batch) if (await applyRevision(entry)) remoteApplied++;
+      }
+      if (sourceFailure) {
+        const sourceError = sourceFailure;
+        discoveryMode = "legacy-list";
+        snapshotComplete = false;
+        initialEntryCount = 0;
+        fallbackReasonClass = `live_delivery:${errorClass(sourceError)}`;
+        sourceFailure = undefined;
+        try { await this.stopSnapshotSession?.(); }
+        catch (cleanupError) { this.options.logger?.error("reconcile.snapshot_cleanup_failed", cleanupError); }
+        this.stopSnapshotSession = undefined;
+        this.buffered.splice(0);
+        this.stopWatch?.();
+        this.stopWatch = await kv.watch((entry) => {
+          if (!entry.key.startsWith("f.")) return;
+          if (this.buffering) this.buffered.push(entry);
+          else this.queueLive(entry);
+        });
+        stage = "remote_fallback";
+        const fallbackStartedAt = performance.now();
+        const fallback = (await kv.list()).filter((entry) => entry.key.startsWith("f.")).sort((left, right) => {
+          try { return Number(decodeRecord(right.value).deleted) - Number(decodeRecord(left.value).deleted); }
+          catch { return 0; }
+        });
+        initialEntryCount = fallback.length;
+        this.discoveryHealthy = true;
+        await this.recoverPathReuse(local, fallback);
+        for (const entry of fallback) {
+          let record: RemoteFileRecord;
+          try { record = decodeRecord(entry.value); }
+          catch { this.reportRecoverableIssue("A remote file record could not be decoded during reconciliation."); continue; }
+          if (!record.deleted) remotePaths.add(record.path);
+          if (await applyRevision(entry)) remoteApplied++;
+        }
+        remoteListMs += Math.round(performance.now() - fallbackStartedAt);
+        discoveryMs = remoteListMs;
+        this.options.logger?.debug("reconcile.snapshot_fallback", {
+          discoveryMode, fallbackReasonClass, initialEntryCount, snapshotComplete,
+        });
+        while (this.buffered.length) {
+          const batch = this.buffered.splice(0).sort((a, b) => a.revision - b.revision);
+          for (const entry of batch) if (await applyRevision(entry)) remoteApplied++;
+        }
       }
       remoteApplyMs = Math.round(performance.now() - remoteApplyStartedAt);
+      this.buffering = false;
+      await this.liveChain;
+      if (sourceFailure) throw sourceFailure;
       stage = "local_apply";
       const localApplyStartedAt = performance.now();
       for (const file of local) {
@@ -479,32 +640,53 @@ export class MarkdownSyncEngine {
       }
       localApplyMs = Math.round(performance.now() - localApplyStartedAt);
       await this.captureChain;
+      if (sourceFailure) throw sourceFailure;
       stage = "outbox_replay";
       const outboxReplayStartedAt = performance.now();
       await this.replayPending(true);
+      if (sourceFailure) throw sourceFailure;
       outboxReplayMs = Math.round(performance.now() - outboxReplayStartedAt);
     } catch (error) {
       const failure = new Error("Reconciliation failed; local outbox retained", { cause: error });
       status.lastError = errorSummary(failure);
       this.options.logger?.error("reconcile.failed", failure, {
-        stage, pending: status.pending, durationMs: Math.round(performance.now() - startedAt),
+        stage, discoveryMode, initialEntryCount, snapshotComplete, fallbackReasonClass,
+        pending: status.pending, durationMs: Math.round(performance.now() - startedAt),
       });
+      this.buffering = false;
+      this.buffered.splice(0);
+      this.discoveryHealthy = false;
+      this.stopWatch?.();
+      this.stopWatch = undefined;
+      try { await this.stopSnapshotSession?.(); }
+      catch (cleanupError) { this.options.logger?.error("reconcile.snapshot_cleanup_failed", cleanupError); }
+      this.stopSnapshotSession = undefined;
       status.connected = false;
       status.reconciled = false;
       status.refresh();
       throw failure;
     } finally {
-      this.buffering = false;
-      const remaining = this.buffered.splice(0).sort((a, b) => a.revision - b.revision);
-      for (const entry of remaining) this.queueLive(entry);
-      await this.liveChain;
+      if (this.buffering) {
+        this.buffering = false;
+        const remaining = this.buffered.splice(0).sort((a, b) => a.revision - b.revision);
+        for (const entry of remaining) this.queueLive(entry);
+        await this.liveChain;
+      }
     }
     status.pending = (await store.pending()).length;
+    if (sourceFailure) {
+      this.discoveryHealthy = false;
+      status.reconciled = false;
+      status.refresh();
+      this.scheduleReconcileAfterSnapshotFailure();
+      return;
+    }
     status.connected = true;
     status.reconciled = true;
     status.refresh();
     this.options.logger?.debug("reconcile.complete", {
       pending: status.pending, conflicts: status.conflicts, remoteApplied, localApplied,
+      discoveryMode, initialEntryCount, snapshotComplete, fallbackReasonClass,
       watchSetupMs, localScanMs, remoteListMs, remoteApplyMs, localApplyMs, outboxReplayMs,
       totalDurationMs: Math.round(performance.now() - startedAt),
     });
@@ -514,8 +696,16 @@ export class MarkdownSyncEngine {
     this.options.status.reconciled = false;
     this.options.status.refresh();
     this.liveChain = this.liveChain.catch(() => {}).then(async () => {
+      if ((this.remoteRevisionBoundary.get(entry.key) ?? -1) >= entry.revision) {
+        if (!this.reconcilePromise && this.discoveryHealthy && !this.stopped) {
+          this.options.status.reconciled = true;
+          this.options.status.refresh();
+        }
+        return;
+      }
       await this.applyRemote(entry.value, entry.revision);
-      if (!this.reconcilePromise) {
+      this.remoteRevisionBoundary.set(entry.key, entry.revision);
+      if (!this.reconcilePromise && this.discoveryHealthy && !this.stopped) {
         this.options.status.reconciled = true;
         this.options.status.refresh();
       }

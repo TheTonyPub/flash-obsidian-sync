@@ -1,4 +1,5 @@
 import { indexedDB as fakeIndexedDB, IDBKeyRange } from "fake-indexeddb";
+import type { KvFileEntry, KvSnapshotSession } from "../../packages/plugin/src/connection.js";
 
 export class VaultDouble {
   readonly files = new Map<string, Uint8Array>();
@@ -101,4 +102,81 @@ export class NatsKvDouble {
     this.listeners.add(wrapped);
     return () => this.listeners.delete(wrapped);
   }
+}
+
+/** Controllable one-subscription snapshot/live source for reconciliation contract tests. */
+export class SnapshotKvSessionDouble implements KvSnapshotSession {
+  private readonly snapshotQueue: KvFileEntry[] = [];
+  private readonly entryQueue: KvFileEntry[] = [];
+  private snapshotWake?: () => void;
+  private entryWake?: () => void;
+  private completeSnapshot!: () => void;
+  private stopped = false;
+  readonly snapshotComplete = new Promise<void>((resolve) => { this.completeSnapshot = resolve; });
+  readonly snapshot = this.iterate(this.snapshotQueue, "snapshot");
+  readonly entries = this.iterate(this.entryQueue, "entries");
+  stopCalls = 0;
+
+  constructor(readonly initialCount = 0) {}
+
+  pushSnapshot(entry: KvFileEntry): void {
+    if (this.stopped) throw new Error("Snapshot session is stopped");
+    this.snapshotQueue.push(copyEntry(entry));
+    this.entryQueue.push(copyEntry(entry));
+    this.wake("snapshot");
+    this.wake("entries");
+  }
+
+  completeInitialSnapshot(): void {
+    if (this.snapshotQueue.length !== this.initialCount) {
+      throw new Error(`Expected ${this.initialCount} initial entries, received ${this.snapshotQueue.length}`);
+    }
+    this.completed = true;
+    this.completeSnapshot();
+    this.wake("snapshot");
+  }
+
+  pushLive(entry: KvFileEntry): void {
+    if (this.stopped) throw new Error("Snapshot session is stopped");
+    this.entryQueue.push(copyEntry(entry));
+    this.wake("entries");
+  }
+
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.stopCalls++;
+    this.wake("snapshot");
+    this.wake("entries");
+  }
+
+  private wake(kind: "snapshot" | "entries"): void {
+    const wake = kind === "snapshot" ? this.snapshotWake : this.entryWake;
+    if (kind === "snapshot") this.snapshotWake = undefined;
+    else this.entryWake = undefined;
+    wake?.();
+  }
+
+  private async *iterate(queue: KvFileEntry[], kind: "snapshot" | "entries"): AsyncGenerator<KvFileEntry> {
+    while (!this.stopped) {
+      const entry = queue.shift();
+      if (entry) { yield entry; continue; }
+      if (kind === "snapshot" && this.snapshotFinished) return;
+      await new Promise<void>((resolve) => {
+        if (kind === "snapshot") this.snapshotWake = resolve;
+        else this.entryWake = resolve;
+      });
+    }
+  }
+
+  private get snapshotFinished(): boolean {
+    // Test-only signal: completion is set by completeInitialSnapshot; race-safe across empty snapshots.
+    return this.completed;
+  }
+
+  private completed = false;
+}
+
+function copyEntry(entry: KvFileEntry): KvFileEntry {
+  return { ...entry, value: entry.value.slice() };
 }

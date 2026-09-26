@@ -20,7 +20,8 @@
     "test:unit": "vitest run tests/unit",
     "test:coverage": "vitest run tests/unit --coverage",
     "test:integration": "vitest run tests/integration --exclude tests/integration/server-cli-bundle.test.ts --passWithNoTests",
-    "test:simulation": "vitest run tests/simulation --passWithNoTests"
+    "test:simulation": "vitest run tests/simulation --passWithNoTests",
+    "benchmark:kv-discovery": "vitest run tests/benchmark/kv-discovery.bench.test.ts"
   },
   "devDependencies": {
     "@codemirror/view": "^6.0.0",

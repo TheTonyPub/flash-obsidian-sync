@@ -1,10 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { KV } from "@nats-io/kv";
 import type { NatsConnection } from "@nats-io/nats-core";
 import { SecretStorageDouble, NatsKvDouble } from "../doubles/index.js";
 import { indexedDBDouble } from "../doubles/index.js";
 import { LocalStore } from "../../packages/plugin/src/local-store.js";
 import { connectVault, NatsKvAdapter, SyncStatus, type VaultConnectionConfig } from "../../packages/plugin/src/connection.js";
+
+const { jetstreamManagerMock, jetstreamMock } = vi.hoisted(() => ({ jetstreamManagerMock: vi.fn(), jetstreamMock: vi.fn() }));
+
+vi.mock("@nats-io/jetstream", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@nats-io/jetstream")>();
+  return { ...actual, jetstreamManager: jetstreamManagerMock, jetstream: jetstreamMock };
+});
 
 const config = (vaultId: string): VaultConnectionConfig => ({
   vaultId,
@@ -15,6 +22,29 @@ const config = (vaultId: string): VaultConnectionConfig => ({
 });
 
 describe("NATS connection", () => {
+  it("skips JetStream API discovery when opening a snapshot session", async () => {
+    const messages = {
+      stop: vi.fn(),
+      [Symbol.asyncIterator]: () => ({ next: () => new Promise<IteratorResult<never>>(() => {}) }),
+    };
+    const consumerManager = {
+      add: vi.fn().mockResolvedValue({ name: "snapshot-consumer", num_pending: 0 }),
+      delete: vi.fn().mockResolvedValue(undefined),
+    };
+    jetstreamManagerMock.mockResolvedValueOnce({ consumers: consumerManager });
+    jetstreamMock.mockReturnValueOnce({ consumers: { get: vi.fn().mockResolvedValue({ consume: vi.fn().mockResolvedValue(messages) }) } });
+    const adapter = new NatsKvAdapter({} as KV, {} as NatsConnection, 0, undefined, "OBS_A_FILES");
+
+    const session = await adapter.openSnapshotSession();
+    await session.stop();
+
+    expect(jetstreamManagerMock).toHaveBeenCalledWith(expect.anything(), { checkAPI: false });
+    const [stream, consumerConfig] = consumerManager.add.mock.calls[0]!;
+    expect(stream).toBe("KV_OBS_A_FILES");
+    expect(consumerConfig.name).toMatch(/^flash-sync-snapshot-[0-9a-f-]+$/);
+    expect(consumerConfig).not.toHaveProperty("durable_name");
+  });
+
   it("lists KV values with bounded concurrency and preserves key order", async () => {
     const keys = Array.from({ length: 12 }, (_, index) => `f.${index}`);
     let active = 0;
